@@ -1,7 +1,11 @@
 ---
 # Read-only: collects the LIVE cluster state and prints connection details for
-# developers. Also writes output/redis-<env>-connection.md and output/redis-<env>.env
-# on the control node. Never prints a password (only whether auth is enabled).
+# developers. Also writes, on the control node:
+#   output/redis-<env>-access.html      developer access page (open in a browser)
+#   output/redis-<env>-connection.md    same content as Markdown
+#   output/redis-<env>.env              env vars for apps
+# Never prints or writes a password (only whether auth is enabled).
+# Runs as the last step of site.yml.
 - name: 98 | Connection info for developers (read-only)
   hosts: redis_cluster[0]
   gather_facts: false
@@ -20,6 +24,7 @@
         - config get maxmemory-policy
         - config get tls-port
         - info server
+        - module list
       register: ci_raw
       changed_when: false
       check_mode: false
@@ -48,6 +53,11 @@
         ci_tls: "{{ (ci_raw.results[4].stdout_lines[1] | default('0') | int) > 0 }}"
         ci_version: "{{ ci_raw.results[5].stdout | regex_search('redis_version:(\\S+)', '\\1') | first }}"
         ci_auth: "{{ (ci_pass.stdout_lines[1] | default('')) | length > 0 }}"
+        # `module list` prints name/<value>/ver/<value>/...; take the value after each "name".
+        ci_modules: >-
+          {{ ci_raw.results[6].stdout_lines | zip(ci_raw.results[6].stdout_lines[1:])
+             | selectattr('0', 'equalto', 'name') | map(attribute='1') | list }}
+        ci_generated: "{{ now(utc=true).strftime('%Y-%m-%d %H:%M UTC') }}"
         ci_sources: >-
           {{ ci_fw.stdout_lines | select('search', 'port="' ~ redis_port ~ '"')
              | map('regex_replace', '.*source address="([^"]+)".*', '\1') | list }}
@@ -69,6 +79,9 @@
           vmid: "{{ hostvars[host].vmid | default('?') }}"
           pve_node: "{{ hostvars[host].pve_node | default('?') }}"
           role: "{{ 'master' if is_master else 'replica' }}"
+          slots: "{{ item[8:] | join(' ') }}"
+          master: "{{ '' if is_master else (ip_to_host[m_ip] | default(m_ip)) }}"
+          master_pve_node: "{{ '' if is_master else (hostvars[ip_to_host[m_ip] | default('')].pve_node | default('?')) }}"
           detail: "{{ ('slots ' ~ (item[8:] | join(' '))) if is_master else ('of ' ~ (ip_to_host[m_ip] | default(m_ip))) }}"
           link: "{{ item[7] }}"
           line: >-
@@ -84,6 +97,15 @@
              | select('in', ci_rows | map(attribute='ip') | list)
              | map('regex_replace', '$', ':' ~ redis_port) | list }}
         ci_unknown: "{{ ci_rows | map(attribute='ip') | reject('in', groups['redis_cluster'] | map('extract', hostvars, 'ip') | list) | list }}"
+        ci_masters: "{{ ci_rows | selectattr('role', 'equalto', 'master') | list | length }}"
+        ci_replicas: "{{ ci_rows | selectattr('role', 'equalto', 'replica') | list | length }}"
+        # true when every replica runs on a different Proxmox host than its master
+        ci_split_ok: >-
+          {{ ci_rows | selectattr('role', 'equalto', 'replica') | list | length > 0 and
+             ci_rows | selectattr('role', 'equalto', 'replica') | selectattr('master_pve_node', 'in', ['', '?']) | list | length == 0 and
+             ci_rows | selectattr('role', 'equalto', 'replica') | map(attribute='pve_node')
+               | zip(ci_rows | selectattr('role', 'equalto', 'replica') | map(attribute='master_pve_node'))
+               | map('unique') | map('length') | select('equalto', 1) | list | length == 0 }}
 
     - name: Connection info
       ansible.builtin.debug:
@@ -103,7 +125,7 @@
         ci_node_lines: "{{ ci_rows | map(attribute='line') | map('regex_replace', '^', '  ') | list }}"
         ci_tail:
           - "{{ ('WARNING: nodes not in inventory: ' ~ ci_unknown | join(', ')) if ci_unknown else 'All cluster nodes are in the inventory.' }}"
-          - "Files    : output/redis-{{ env_name }}-connection.md, output/redis-{{ env_name }}.env"
+          - "Files    : output/redis-{{ env_name }}-access.html, output/redis-{{ env_name }}-connection.md, output/redis-{{ env_name }}.env"
 
     - name: Output directory on the control node
       ansible.builtin.file:
@@ -113,12 +135,13 @@
       delegate_to: localhost
       become: false
 
-    - name: Write developer handoff (Markdown) and env file
+    - name: Write developer handoff (HTML page, Markdown, env file)
       ansible.builtin.template:
         src: "{{ item.src }}"
         dest: "{{ out_dir }}/{{ item.dest }}"
         mode: "0644"
       loop:
+        - { src: connection-info.html.j2, dest: 'redis-{{ env_name }}-access.html' }
         - { src: connection-info.md.j2, dest: 'redis-{{ env_name }}-connection.md' }
         - { src: connection-info.env.j2, dest: 'redis-{{ env_name }}.env' }
       delegate_to: localhost
