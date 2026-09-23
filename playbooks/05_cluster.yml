@@ -1,5 +1,5 @@
 ---
-# Create the cluster from redis-dev-01 only.
+# Create the cluster from the first inventory host (redis_cluster[0]) only.
 #   * healthy cluster (state ok + 16384 slots)     -> no create
 #   * all 3 masters fresh (1 known node, 0 slots)  -> create with masters only
 #   * anything else                                -> STOP (manual attention)

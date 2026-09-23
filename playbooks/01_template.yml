@@ -1,6 +1,6 @@
 ---
-# Build template 9010 (AlmaLinux 10 GenericCloud) on Ceph. Skipped entirely if
-# 9010 already exists as OUR template. Every mutating step is guarded by the
+# Build the cloud-init template (pve_template_vmid; AlmaLinux 10 GenericCloud) on Ceph.
+# Skipped entirely if it already exists as OUR template. Every mutating step is guarded by the
 # current `qm config`, so an interrupted run resumes where it stopped.
 - name: 01 | AlmaLinux 10 cloud-init template
   hosts: pve_template
@@ -74,7 +74,7 @@
               - --tags
               - "{{ pve_tag }}"
               - --description
-              - "Managed by Ansible (redis-dev project). Template for VMs 270-275."
+              - "Managed by Ansible (redis-{{ env_name }} project). Template for VMs {{ groups['redis_cluster'] | map('extract', hostvars, 'vmid') | join(', ') }}."
               - --ostype
               - "l26"
               - --cores

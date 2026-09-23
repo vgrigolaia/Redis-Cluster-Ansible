@@ -1,7 +1,13 @@
 ---
 ansible_user: "{{ ci_user }}"
 ansible_become: true
-# Dev VMs get rebuilt with new host keys; don't pollute known_hosts.
+# PROD pins VM host keys: trusted on first connect (accept-new), then a changed
+# key is refused. Kept in a project-specific file so rebuilding DEV (same user,
+# other IPs) never touches it. After a deliberate PROD rebuild, remove the old
+# entries:  ssh-keygen -R <ip> -f ~/.ssh/known_hosts_redis_prod
 # IdentityAgent=SSH_AUTH_SOCK: ~/.ssh/config's `Host *` points at the 1Password
 # agent, which doesn't hold the VM key; use the ssh-agent from the shell instead.
-ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentityAgent=SSH_AUTH_SOCK
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=accept-new
+  -o UserKnownHostsFile=~/.ssh/known_hosts_redis_{{ env_name }}
+  -o IdentityAgent=SSH_AUTH_SOCK

@@ -1,4 +1,4 @@
-# Vault password (plain text) - never commit. ansible.cfg reads ~/.ansible/redis-dev.vault-pass
+# Vault password (plain text) - never commit. ansible.cfg reads ~/.ansible/redis-<env>.vault-pass
 pwd
 *.vault-pass
 .vault_pass*
