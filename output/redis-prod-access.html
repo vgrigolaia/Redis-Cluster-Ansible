@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Redis PROD Cluster Access</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --paper: #f5f6f3;
+    --surface: #ffffff;
+    --ink: #1c211f;
+    --muted: #5b6561;
+    --rule: #d6dbd7;
+    --accent: #9a3b1f;
+    --accent-soft: #f6e6df;
+    --warn: #8a5300;
+    --warn-soft: #fbf0dc;
+    --bad: #a3261b;
+    --bad-soft: #fbe4e1;
+    --code-bg: #eef1ee;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-head: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --paper: #121615;
+      --surface: #1a1f1e;
+      --ink: #e4e9e6;
+      --muted: #9aa6a1;
+      --rule: #2d3533;
+      --accent: #f0916f;
+      --accent-soft: #3a1f16;
+      --warn: #e8b35a;
+      --warn-soft: #2e2615;
+      --bad: #f28b82;
+      --bad-soft: #3a1714;
+      --code-bg: #0e1211;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --paper: #121615;
+    --surface: #1a1f1e;
+    --ink: #e4e9e6;
+    --muted: #9aa6a1;
+    --rule: #2d3533;
+    --accent: #f0916f;
+    --accent-soft: #3a1f16;
+    --warn: #e8b35a;
+    --warn-soft: #2e2615;
+    --bad: #f28b82;
+    --bad-soft: #3a1714;
+    --code-bg: #0e1211;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.6 var(--font-body);
+    padding-inline: 16px;
+    padding-block: 40px 64px;
+  }
+  .page { max-width: 820px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 40px; }
+  h1, h2 { font-family: var(--font-head); text-wrap: balance; margin: 0; line-height: 1.15; }
+  h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 21px; font-weight: 600; }
+  p { margin: 0; max-width: 68ch; }
+  .eyebrow { font: 500 12px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+  header { display: grid; gap: 12px; }
+  header p { color: var(--muted); }
+  section, .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  code, pre, .mono { font-family: var(--font-mono); font-size: 13.5px; }
+  :not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+  .facts { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; display: grid; margin: 0; }
+  .fact { display: grid; grid-template-columns: 170px 1fr; gap: 16px; padding: 12px 18px; border-top: 1px solid var(--rule); align-items: baseline; }
+  .fact:first-child { border-top: 0; }
+  .fact dt { color: var(--muted); font-size: 13px; }
+  .fact dd { margin: 0; min-width: 0; }
+  .strong { font-weight: 600; }
+  .seeds { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .seeds code { word-break: break-all; }
+  @media (max-width: 560px) { .fact { grid-template-columns: 1fr; gap: 2px; } }
+
+  button { font: 500 12.5px/1 var(--font-body); color: var(--accent); background: var(--accent-soft); border: 1px solid transparent; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible, [role="tab"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; min-width: 620px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 10px 14px; border-top: 1px solid var(--rule); white-space: nowrap; }
+  thead th { border-top: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .role { font: 500 12px/1 var(--font-mono); padding: 3px 7px; border-radius: 4px; }
+  .role.m { background: var(--accent-soft); color: var(--accent); }
+  .role.r { background: var(--code-bg); color: var(--muted); }
+  .link-bad { color: var(--bad); font-weight: 600; }
+  .note { color: var(--muted); font-size: 13.5px; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  [role="tab"] { background: transparent; color: var(--muted); border: 1px solid var(--rule); }
+  [role="tab"][aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .panel { gap: 10px; }
+  .code { position: relative; }
+  pre { margin: 0; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; overflow-x: auto; line-height: 1.55; }
+  .code button { position: absolute; top: 8px; right: 8px; }
+
+  .rules { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .rules li { display: grid; gap: 4px; padding-left: 16px; border-left: 2px solid var(--rule); }
+  .rules strong { font-weight: 600; }
+  .callout { background: var(--warn-soft); border-radius: 8px; padding: 14px 18px; display: grid; gap: 6px; }
+  .callout strong { color: var(--warn); }
+  .callout.bad { background: var(--bad-soft); }
+  .callout.bad strong { color: var(--bad); }
+  footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--rule); padding-top: 16px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <span class="eyebrow">PROD environment · Redis Open Source 8.10.2</span>
+    <h1>Redis PROD Cluster Access</h1>
+    <p>How to connect an application to the <strong>production</strong> Redis Cluster: 3 masters, 3 replicas, cluster mode, password required. Use a cluster-aware client and keep every connection setting in configuration.</p>
+  </header>
+
+  <section aria-labelledby="glance">
+    <h2 id="glance">At a glance</h2>
+    <dl class="facts">
+      <div class="fact"><dt>Mode</dt><dd><strong>Redis Cluster</strong>, so a cluster-aware client is required (a plain single-node client gets <code>MOVED</code> errors)</dd></div>
+      <div class="fact"><dt>Seed nodes</dt><dd class="seeds">
+        <code id="seedlist">10.50.200.91:6379,10.50.200.92:6379,10.50.200.93:6379,10.50.200.94:6379,10.50.200.95:6379,10.50.200.96:6379</code>
+        <button type="button" data-copy="seedlist">Copy</button></dd></div>
+      <div class="fact"><dt>Port</dt><dd class="mono">6379 <span class="note">(16379 is the internal cluster bus; apps don't use it)</span></dd></div>
+      <div class="fact"><dt>Username / password</dt><dd><span class="strong">Password required.</span> No username (the <code>default</code> user). The password is not in this page: get it from DevOps / your secret store and inject it as <code>REDIS_PASSWORD</code>. Never commit it.</dd></div>
+      <div class="fact"><dt>TLS</dt><dd>Off (plain TCP)</dd></div>
+      <div class="fact"><dt>Database</dt><dd><code>0</code> only (cluster mode has no <code>SELECT</code>)</dd></div>
+      <div class="fact"><dt>Network access</dt><dd>Only from <code>10.50.200.0/24</code>. Any other network needs a firewall change; ask DevOps.</dd></div>
+      <div class="fact"><dt>Memory</dt><dd>2560 MB per master (~7.5 GB total), policy <code>noeviction</code></dd></div>
+      <div class="fact"><dt>Modules</dt><dd>Vector sets, TimeSeries, JSON, Bloom, Search (Query Engine)</dd></div>
+    </dl>
+  </section>
+
+  <section aria-labelledby="nodes">
+    <h2 id="nodes">Nodes</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Node</th><th>Address</th><th>Role</th><th>Slots / replicates</th><th>Proxmox host</th><th>Link</th></tr></thead>
+        <tbody>
+          <tr><td>redis-prod-01</td><td class="mono">10.50.200.91:6379</td><td><span class="role m">master</span></td><td>0–5460</td><td>DC-A-PVE-11</td><td>connected</td></tr>
+          <tr><td>redis-prod-02</td><td class="mono">10.50.200.92:6379</td><td><span class="role m">master</span></td><td>5461–10922</td><td>DC-A-PVE-12</td><td>connected</td></tr>
+          <tr><td>redis-prod-03</td><td class="mono">10.50.200.93:6379</td><td><span class="role m">master</span></td><td>10923–16383</td><td>DC-A-PVE-13</td><td>connected</td></tr>
+          <tr><td>redis-prod-04</td><td class="mono">10.50.200.94:6379</td><td><span class="role r">replica</span></td><td>of redis-prod-03</td><td>DC-A-PVE-11</td><td>connected</td></tr>
+          <tr><td>redis-prod-05</td><td class="mono">10.50.200.95:6379</td><td><span class="role r">replica</span></td><td>of redis-prod-01</td><td>DC-A-PVE-12</td><td>connected</td></tr>
+          <tr><td>redis-prod-06</td><td class="mono">10.50.200.96:6379</td><td><span class="role r">replica</span></td><td>of redis-prod-02</td><td>DC-A-PVE-13</td><td>connected</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Roles can swap after a failover. Don't hard-code "the master"; give the client all 6 seeds and let it discover the topology.</p>
+  </section>
+
+  <section aria-labelledby="clients">
+    <h2 id="clients">Client configuration</h2>
+    <p class="note">All examples read the password from the <code>REDIS_PASSWORD</code> environment variable.</p>
+    <div class="tabs" role="tablist" aria-label="Client">
+      <button type="button" role="tab" id="t-env" aria-controls="p-env" aria-selected="true">Env vars</button>
+      <button type="button" role="tab" id="t-spring" aria-controls="p-spring" aria-selected="false">Spring Boot</button>
+      <button type="button" role="tab" id="t-lettuce" aria-controls="p-lettuce" aria-selected="false">Java · Lettuce</button>
+      <button type="button" role="tab" id="t-jedis" aria-controls="p-jedis" aria-selected="false">Java · Jedis</button>
+      <button type="button" role="tab" id="t-py" aria-controls="p-py" aria-selected="false">Python</button>
+      <button type="button" role="tab" id="t-ioredis" aria-controls="p-ioredis" aria-selected="false">Node · ioredis</button>
+      <button type="button" role="tab" id="t-noderedis" aria-controls="p-noderedis" aria-selected="false">Node · node-redis</button>
+      <button type="button" role="tab" id="t-go" aria-controls="p-go" aria-selected="false">Go</button>
+      <button type="button" role="tab" id="t-net" aria-controls="p-net" aria-selected="false">.NET</button>
+      <button type="button" role="tab" id="t-php" aria-controls="p-php" aria-selected="false">PHP</button>
+      <button type="button" role="tab" id="t-cli" aria-controls="p-cli" aria-selected="false">redis-cli</button>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-env" aria-labelledby="t-env">
+      <div class="code"><button type="button" data-copy="c-env">Copy</button><pre id="c-env">REDIS_CLUSTER_ENABLED=true
+REDIS_CLUSTER_NODES=10.50.200.91:6379,10.50.200.92:6379,10.50.200.93:6379,10.50.200.94:6379,10.50.200.95:6379,10.50.200.96:6379
+REDIS_USERNAME=
+REDIS_PASSWORD=&lt;from your secret store&gt;
+REDIS_TLS=false</pre></div>
+      <p class="note">Keep username, password and TLS as settings even when they are empty, so switching environments only changes values, not code.</p>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-spring" aria-labelledby="t-spring" hidden>
+      <div class="code"><button type="button" data-copy="c-spring">Copy</button><pre id="c-spring"># application-prod.yml (Spring Boot 3, Lettuce)
+spring:
+  data:
+    redis:
+      cluster:
+        nodes: 10.50.200.91:6379,10.50.200.92:6379,10.50.200.93:6379,10.50.200.94:6379,10.50.200.95:6379,10.50.200.96:6379
+        max-redirects: 3
+      timeout: 2s
+      password: ${REDIS_PASSWORD}
+      lettuce:
+        cluster:
+          refresh:
+            adaptive: true   # follow failovers quickly
+            period: 30s</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-lettuce" aria-labelledby="t-lettuce" hidden>
+      <div class="code"><button type="button" data-copy="c-lettuce">Copy</button><pre id="c-lettuce">List&lt;RedisURI&gt; seeds = Stream.of(
+        "10.50.200.91", "10.50.200.92", "10.50.200.93",
+        "10.50.200.94", "10.50.200.95", "10.50.200.96")
+    .map(h -&gt; RedisURI.builder().withHost(h).withPort(6379)
+        .withPassword(System.getenv("REDIS_PASSWORD").toCharArray())
+        .withSsl(false).build())
+    .toList();
+
+RedisClusterClient client = RedisClusterClient.create(seeds);
+client.setOptions(ClusterClientOptions.builder()
+    .topologyRefreshOptions(ClusterTopologyRefreshOptions.builder()
+        .enableAllAdaptiveRefreshTriggers()
+        .enablePeriodicRefresh(Duration.ofSeconds(30))
+        .build())
+    .build());
+
+StatefulRedisClusterConnection&lt;String, String&gt; conn = client.connect();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-jedis" aria-labelledby="t-jedis" hidden>
+      <div class="code"><button type="button" data-copy="c-jedis">Copy</button><pre id="c-jedis">Set&lt;HostAndPort&gt; seeds = Set.of(
+    new HostAndPort("10.50.200.91", 6379), new HostAndPort("10.50.200.92", 6379),
+    new HostAndPort("10.50.200.93", 6379), new HostAndPort("10.50.200.94", 6379),
+    new HostAndPort("10.50.200.95", 6379), new HostAndPort("10.50.200.96", 6379));
+
+JedisClientConfig config = DefaultJedisClientConfig.builder()
+    .password(System.getenv("REDIS_PASSWORD"))
+    .build();
+
+try (JedisCluster redis = new JedisCluster(seeds, config)) {
+    redis.set("hello", "world");
+}</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-py" aria-labelledby="t-py" hidden>
+      <div class="code"><button type="button" data-copy="c-py">Copy</button><pre id="c-py"># redis-py &gt;= 4.1
+import os
+from redis.cluster import RedisCluster, ClusterNode
+
+seeds = ["10.50.200.91", "10.50.200.92", "10.50.200.93",
+         "10.50.200.94", "10.50.200.95", "10.50.200.96"]
+rc = RedisCluster(
+    startup_nodes=[ClusterNode(h, 6379) for h in seeds],
+    password=os.environ["REDIS_PASSWORD"],
+    decode_responses=True,
+)
+rc.set("hello", "world")</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-ioredis" aria-labelledby="t-ioredis" hidden>
+      <div class="code"><button type="button" data-copy="c-ioredis">Copy</button><pre id="c-ioredis">const Redis = require("ioredis");
+
+const cluster = new Redis.Cluster([
+  { host: "10.50.200.91", port: 6379 }, { host: "10.50.200.92", port: 6379 },
+  { host: "10.50.200.93", port: 6379 }, { host: "10.50.200.94", port: 6379 },
+  { host: "10.50.200.95", port: 6379 }, { host: "10.50.200.96", port: 6379 },
+], {
+  redisOptions: {
+    password: process.env.REDIS_PASSWORD,
+  },
+});
+
+await cluster.set("hello", "world");</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-noderedis" aria-labelledby="t-noderedis" hidden>
+      <div class="code"><button type="button" data-copy="c-noderedis">Copy</button><pre id="c-noderedis">import { createCluster } from "redis";   // node-redis v4+
+
+const cluster = createCluster({
+  rootNodes: [
+    "10.50.200.91", "10.50.200.92", "10.50.200.93",
+    "10.50.200.94", "10.50.200.95", "10.50.200.96",
+  ].map((h) =&gt; ({ url: `redis://${h}:6379` })),
+  defaults: { password: process.env.REDIS_PASSWORD },
+});
+cluster.on("error", (err) =&gt; console.error("Redis cluster error", err));
+await cluster.connect();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-go" aria-labelledby="t-go" hidden>
+      <div class="code"><button type="button" data-copy="c-go">Copy</button><pre id="c-go">// github.com/redis/go-redis/v9
+rdb := redis.NewClusterClient(&amp;redis.ClusterOptions{
+    Addrs: []string{
+        "10.50.200.91:6379", "10.50.200.92:6379", "10.50.200.93:6379",
+        "10.50.200.94:6379", "10.50.200.95:6379", "10.50.200.96:6379",
+    },
+    Password: os.Getenv("REDIS_PASSWORD"),
+})
+err := rdb.Set(ctx, "hello", "world", 0).Err()</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-net" aria-labelledby="t-net" hidden>
+      <div class="code"><button type="button" data-copy="c-net">Copy</button><pre id="c-net">// StackExchange.Redis detects cluster mode automatically
+var mux = ConnectionMultiplexer.Connect(
+    "10.50.200.91:6379,10.50.200.92:6379,10.50.200.93:6379," +
+    "10.50.200.94:6379,10.50.200.95:6379,10.50.200.96:6379," +
+    "password=" + Environment.GetEnvironmentVariable("REDIS_PASSWORD") + "," +
+    "abortConnect=false,connectTimeout=5000");
+IDatabase db = mux.GetDatabase();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-php" aria-labelledby="t-php" hidden>
+      <div class="code"><button type="button" data-copy="c-php">Copy</button><pre id="c-php">// phpredis
+$redis = new RedisCluster(null, [
+    '10.50.200.91:6379', '10.50.200.92:6379', '10.50.200.93:6379',
+    '10.50.200.94:6379', '10.50.200.95:6379', '10.50.200.96:6379',
+], 2.0, 2.0, false, getenv('REDIS_PASSWORD'));
+$redis-&gt;set('hello', 'world');</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-cli" aria-labelledby="t-cli" hidden>
+      <div class="code"><button type="button" data-copy="c-cli">Copy</button><pre id="c-cli"># redis-cli reads the password from REDISCLI_AUTH (never pass it with -a)
+export REDISCLI_AUTH="$REDIS_PASSWORD"
+# -c follows cluster redirects
+redis-cli -c -h 10.50.200.91 -p 6379
+10.50.200.91:6379&gt; cluster info
+10.50.200.91:6379&gt; set hello world</pre></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="rules">
+    <h2 id="rules">Things to know when coding against it</h2>
+    <ul class="rules">
+      <li><strong>The client must reach all 6 nodes on 6379.</strong><span>Clients get redirected (<code>MOVED</code>/<code>ASK</code>) to whichever node owns a key's slot, so every node has to be reachable, not just one seed.</span></li>
+      <li><strong>Multi-key commands need a shared hash tag.</strong><span><code>MGET</code>, <code>MSET</code>, transactions, Lua scripts and <code>SUNION</code>-style commands only work when all keys are in one slot. Put the common part in braces: <code>{user:42}:profile</code>, <code>{user:42}:cart</code>. Otherwise you get a <code>CROSSSLOT</code> error.</span></li>
+      <li><strong>Nothing is evicted.</strong><span>With 2560 MB per master and <code>noeviction</code>, writes fail with an <code>OOM</code> error when a shard is full. Set TTLs on cache keys.</span></li>
+      <li><strong>Plan for a few seconds of failover.</strong><span>Node timeout is 5 s, so a replica takes over a few seconds after its master fails. Enable topology refresh (see the Spring Boot and Lettuce examples) and retry on connection errors.</span></li>
+      <li><strong>Modules are loaded.</strong><span>Vector sets, TimeSeries, JSON, Bloom, Search (Query Engine). Check their cluster behaviour in DEV before relying on them in production.</span></li>
+    </ul>
+    <div class="callout">
+      <strong>Production rules</strong>
+      <p>Keep the password in a secret store and inject it at runtime; never put it in code, images or logs. Don't run <code>KEYS</code>, <code>FLUSHALL</code>/<code>FLUSHDB</code>, load tests or debugging sessions here; use DEV for that. Data is persisted (RDB + AOF) and replicated, but it is not a backup, so keep your system of record elsewhere. Config changes go through DevOps.</p>
+    </div>
+  </section>
+
+  <footer>Generated 2026-09-23 19:18 UTC by Ansible (<code>playbooks/98_connection_info.yml</code>) from the live cluster: Redis Open Source 8.10.2, cluster_state ok, 16384/16384 slots, 3 masters + 3 replicas, each replica on a different Proxmox host than its master.</footer>
+</div>
+
+<script>
+  // Tabs
+  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+  function select(tab, focus) {
+    tabs.forEach(t => {
+      const on = t === tab;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    if (focus) tab.focus();
+  }
+  tabs.forEach((t, i) => {
+    t.tabIndex = i === 0 ? 0 : -1;
+    t.addEventListener('click', () => select(t, false));
+    t.addEventListener('keydown', e => {
+      const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (d) { e.preventDefault(); select(tabs[(i + d + tabs.length) % tabs.length], true); }
+    });
+  });
+
+  // Copy buttons
+  document.querySelectorAll('[data-copy]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const el = document.getElementById(btn.dataset.copy);
+      const text = el.innerText;
+      const done = () => { const o = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = o, 1500); };
+      const fallback = () => {
+        const r = document.createRange(); r.selectNodeContents(el);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        btn.textContent = 'Selected, press Ctrl+C';
+        setTimeout(() => btn.textContent = 'Copy', 2500);
+      };
+      try {
+        navigator.clipboard.writeText(text).then(done, fallback);
+      } catch (e) { fallback(); }
+    });
+  });
+</script>
+</body>
+</html>
