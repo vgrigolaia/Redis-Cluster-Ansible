@@ -1,0 +1,125 @@
+---
+# Read-only: collects the LIVE cluster state and prints connection details for
+# developers. Also writes output/redis-dev-connection.md and output/redis-dev.env
+# on the control node. Never prints a password (only whether auth is enabled).
+- name: 98 | Connection info for developers (read-only)
+  hosts: redis_cluster[0]
+  gather_facts: false
+  environment: "{{ redis_cli_env }}"
+  vars:
+    cli: redis-cli -p {{ redis_port }} -h {{ ip }}
+    ip_to_host: "{{ dict(groups['redis_cluster'] | map('extract', hostvars, 'ip') | zip(groups['redis_cluster'])) }}"
+    out_dir: "{{ playbook_dir }}/../output"
+  tasks:
+    - name: Read live cluster state
+      ansible.builtin.command: "{{ cli }} {{ item }}"
+      loop:
+        - cluster info
+        - cluster nodes
+        - config get maxmemory
+        - config get maxmemory-policy
+        - config get tls-port
+        - info server
+      register: ci_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Is a password configured? (value is never shown)
+      ansible.builtin.command: "{{ cli }} config get requirepass"
+      register: ci_pass
+      changed_when: false
+      check_mode: false
+      no_log: true
+
+    - name: Firewall rules on the node
+      ansible.builtin.command: firewall-cmd --list-rich-rules
+      become: true
+      register: ci_fw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse
+      ansible.builtin.set_fact:
+        ci_state: "{{ ci_raw.results[0].stdout | regex_search('cluster_state:(\\w+)', '\\1') | first }}"
+        ci_slots: "{{ ci_raw.results[0].stdout | regex_search('cluster_slots_assigned:(\\d+)', '\\1') | first }}"
+        ci_nodes: "{{ ci_raw.results[1].stdout_lines | map('split') | list }}"
+        ci_maxmem: "{{ ci_raw.results[2].stdout_lines[1] | int }}"
+        ci_policy: "{{ ci_raw.results[3].stdout_lines[1] }}"
+        ci_tls: "{{ (ci_raw.results[4].stdout_lines[1] | default('0') | int) > 0 }}"
+        ci_version: "{{ ci_raw.results[5].stdout | regex_search('redis_version:(\\S+)', '\\1') | first }}"
+        ci_auth: "{{ (ci_pass.stdout_lines[1] | default('')) | length > 0 }}"
+        ci_sources: >-
+          {{ ci_fw.stdout_lines | select('search', 'port="' ~ redis_port ~ '"')
+             | map('regex_replace', '.*source address="([^"]+)".*', '\1') | list }}
+
+    - name: Build node rows (live roles)
+      ansible.builtin.set_fact:
+        ci_rows: "{{ ci_rows | default([]) + [row] }}"
+      loop: "{{ ci_nodes }}"
+      loop_control:
+        label: "{{ item[1] }}"
+      vars:
+        nip: "{{ item[1] | regex_replace(':.*$', '') }}"
+        host: "{{ ip_to_host[nip] | default(nip) }}"
+        is_master: "{{ 'master' in item[2] }}"
+        m_ip: "{{ '' if is_master else (ci_nodes | selectattr('0', 'equalto', item[3]) | map(attribute='1') | first | default('') | regex_replace(':.*$', '')) }}"
+        row:
+          host: "{{ host }}"
+          ip: "{{ nip }}"
+          vmid: "{{ hostvars[host].vmid | default('?') }}"
+          pve_node: "{{ hostvars[host].pve_node | default('?') }}"
+          role: "{{ 'master' if is_master else 'replica' }}"
+          detail: "{{ ('slots ' ~ (item[8:] | join(' '))) if is_master else ('of ' ~ (ip_to_host[m_ip] | default(m_ip))) }}"
+          link: "{{ item[7] }}"
+          line: >-
+            {{ hostvars[host].vmid | default('?') }} {{ host }}  {{ nip }}:{{ redis_port }}  {{ hostvars[host].pve_node | default('?') }}
+            {{ 'master' if is_master else 'replica' }}
+            {{ ('slots ' ~ (item[8:] | join(' '))) if is_master else ('of ' ~ (ip_to_host[m_ip] | default(m_ip))) }} [{{ item[7] }}]
+
+    - name: Seeds (inventory order, only nodes that are really in the cluster)
+      ansible.builtin.set_fact:
+        ci_rows: "{{ ci_rows | sort(attribute='host') }}"
+        ci_seeds: >-
+          {{ groups['redis_cluster'] | map('extract', hostvars, 'ip')
+             | select('in', ci_rows | map(attribute='ip') | list)
+             | map('regex_replace', '$', ':' ~ redis_port) | list }}
+        ci_unknown: "{{ ci_rows | map(attribute='ip') | reject('in', groups['redis_cluster'] | map('extract', hostvars, 'ip') | list) | list }}"
+
+    - name: Connection info
+      ansible.builtin.debug:
+        msg: "{{ ci_head + ci_node_lines + ci_tail }}"
+      vars:
+        ci_head:
+          - "Redis Cluster DEV - Redis Open Source {{ ci_version }}  (cluster_state: {{ ci_state }}, slots: {{ ci_slots }}/16384)"
+          - "Mode     : Redis Cluster - use a cluster-aware client"
+          - "Seeds    : {{ ci_seeds | join(',') }}"
+          - "Port     : {{ redis_port }}  (cluster bus {{ redis_bus_port }} is internal)"
+          - "Auth     : {{ 'ENABLED - password is in the Ansible vault, ask DevOps' if ci_auth else 'none (no username, no password)' }}"
+          - "TLS      : {{ 'on' if ci_tls else 'off' }}"
+          - "Database : 0 only (no SELECT in cluster mode)"
+          - "Access   : {{ ci_sources | join(', ') if ci_sources else 'no source restriction found in firewalld rules' }}"
+          - "Memory   : {{ ci_maxmem | int | human_readable }} per master, policy {{ ci_policy }}"
+          - "Nodes    : {{ ci_rows | selectattr('role', 'equalto', 'master') | list | length }} masters / {{ ci_rows | selectattr('role', 'equalto', 'replica') | list | length }} replicas"
+        ci_node_lines: "{{ ci_rows | map(attribute='line') | map('regex_replace', '^', '  ') | list }}"
+        ci_tail:
+          - "{{ ('WARNING: nodes not in inventory: ' ~ ci_unknown | join(', ')) if ci_unknown else 'All cluster nodes are in the inventory.' }}"
+          - "Files    : output/redis-dev-connection.md, output/redis-dev.env"
+
+    - name: Output directory on the control node
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Write developer handoff (Markdown) and env file
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ out_dir }}/{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: connection-info.md.j2, dest: redis-dev-connection.md }
+        - { src: connection-info.env.j2, dest: redis-dev.env }
+      delegate_to: localhost
+      become: false

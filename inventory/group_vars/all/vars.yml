@@ -1,0 +1,59 @@
+---
+# ---------------------------------------------------------------- Proxmox
+pve_template_node: "{{ groups['pve_template'][0] }}"   # set in inventory
+pve_template_vmid: 9010
+pve_template_name: alma10-redis-dev-tpl
+pve_storage: RBD-Disk
+pve_bridge: vmbr0
+pve_vlan_tag: ""            # empty = untagged
+pve_tag: redis-dev          # Proxmox tag set on the template and every VM
+# Hard safety allow-list: no task may touch a VMID outside this list.
+pve_managed_vmids: [9010, 270, 271, 272, 273, 274, 275]
+
+# ---------------------------------------------------------------- Image
+alma_image_base_url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images
+alma_image_file: AlmaLinux-10-GenericCloud-10.2-20260817.0.x86_64.qcow2
+alma_image_sha256: bc59485c4828861a15887e30ff1bb913f0f16202fd7286208518f4814da1e10a
+alma_image_dir: /var/tmp/redis-dev-image
+
+# ---------------------------------------------------------------- VM sizing
+vm_cores: 1
+vm_cpu_type: host
+vm_memory_mb: 1024
+vm_disk_size: 10G
+vm_net0: "virtio,bridge={{ pve_bridge }}{{ (',tag=' ~ pve_vlan_tag) if pve_vlan_tag | string | length > 0 else '' }}"
+
+# ---------------------------------------------------------------- Network / cloud-init
+net_prefix: 24
+net_netmask: 255.255.255.0
+net_gateway: 10.50.200.1
+net_cidr: 10.50.200.0/24
+net_dns: 1.1.1.1
+ci_user: almalinux
+ci_password_hash: "{{ vault_almalinux_password_hash }}"   # vault.yml; console login
+ci_ssh_pubkey_file: ~/.ssh/id_ed25519.pub   # read on the Ansible control node
+
+# ---------------------------------------------------------------- Redis
+redis_version: 8.10.2
+redis_repo_baseurl: https://packages.redis.io/rpm/rockylinux10
+redis_repo_gpgkey: https://packages.redis.io/gpg
+redis_port: 6379
+redis_bus_port: 16379
+redis_maxmemory: 256mb
+redis_maxmemory_policy: noeviction
+redis_cluster_node_timeout: 5000
+# Redis 8 package ships Search/JSON/Bloom/TimeSeries; set false if prod runs plain Redis.
+redis_load_modules: true
+redis_modules:
+  - /usr/lib/redis/modules/rejson.so
+  - /usr/lib/redis/modules/redisbloom.so
+  - /usr/lib/redis/modules/redistimeseries.so
+  - /usr/lib/redis/modules/redisearch.so
+
+# No password in dev. To enable auth later: put
+# vault_redis_password in an ansible-vault encrypted group_vars/all/vault.yml
+# and change this line to:  redis_password: "{{ vault_redis_password }}"
+redis_password: ""
+
+# Environment for redis-cli; REDISCLI_AUTH is only set when a password exists.
+redis_cli_env: "{{ {'REDISCLI_AUTH': redis_password} if redis_password | length > 0 else {} }}"

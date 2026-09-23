@@ -1,0 +1,68 @@
+# {{ ansible_managed }}
+# Redis {{ redis_version }} - DEV cluster node {{ inventory_hostname }} (shard {{ shard }})
+# Original package config backed up at {{ redis_conf_path }}.orig
+
+{% if redis_load_modules %}
+{% for m in redis_modules %}
+loadmodule {{ m }}
+{% endfor %}
+{% endif %}
+
+# ---------------------------------------------------------------- network
+bind {{ ip }} 127.0.0.1 -::1
+port {{ redis_port }}
+protected-mode {{ 'yes' if redis_password | length > 0 else 'no' }}
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+
+# ---------------------------------------------------------------- process
+daemonize no
+supervised systemd
+pidfile /run/redis/redis-server.pid
+loglevel notice
+logfile {{ redis_log_dir }}/redis-server.log
+databases 16
+always-show-logo no
+disable-thp yes
+
+# ---------------------------------------------------------------- memory
+maxmemory {{ redis_maxmemory }}
+maxmemory-policy {{ redis_maxmemory_policy }}
+
+# ---------------------------------------------------------------- persistence
+dir {{ redis_data_dir }}
+dbfilename dump.rdb
+save 3600 1 300 100 60 10000
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+appendonly yes
+appendfilename "appendonly.aof"
+appenddirname "appendonlydir"
+appendfsync everysec
+aof-use-rdb-preamble yes
+
+# ---------------------------------------------------------------- replication
+replica-serve-stale-data yes
+replica-read-only yes
+repl-diskless-sync yes
+{% if redis_password | length > 0 %}
+requirepass {{ redis_password }}
+masterauth {{ redis_password }}
+{% endif %}
+
+# ---------------------------------------------------------------- cluster
+cluster-enabled yes
+cluster-config-file nodes-{{ redis_port }}.conf
+cluster-node-timeout {{ redis_cluster_node_timeout }}
+cluster-require-full-coverage no
+cluster-port {{ redis_bus_port }}
+cluster-announce-ip {{ ip }}
+cluster-announce-port {{ redis_port }}
+cluster-announce-bus-port {{ redis_bus_port }}
+
+# ---------------------------------------------------------------- misc
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+jemalloc-bg-thread yes

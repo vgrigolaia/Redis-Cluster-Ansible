@@ -1,0 +1,166 @@
+---
+# Build template 9010 (AlmaLinux 10 GenericCloud) on Ceph. Skipped entirely if
+# 9010 already exists as OUR template. Every mutating step is guarded by the
+# current `qm config`, so an interrupted run resumes where it stopped.
+- name: 01 | AlmaLinux 10 cloud-init template
+  hosts: pve_template
+  gather_facts: false
+  vars:
+    tpl_id: "{{ pve_template_vmid }}"
+    tpl_img: "{{ alma_image_dir }}/{{ alma_image_file }}"
+    tpl_keyfile: "{{ alma_image_dir }}/ci_sshkeys.pub"
+  tasks:
+    - name: Safety preflight
+      ansible.builtin.import_tasks: tasks/preflight.yml
+
+    - name: Is template {{ tpl_id }} already done?
+      ansible.builtin.set_fact:
+        tpl_done: "{{ (pf_existing[pve_template_vmid].template | default(0) | int) == 1 }}"
+
+    - name: Template status
+      ansible.builtin.debug:
+        msg: "{{ 'Template ' ~ tpl_id ~ ' already exists - skipping build.' if tpl_done else 'Template ' ~ tpl_id ~ ' will be built on ' ~ inventory_hostname ~ '.' }}"
+
+    - name: Build template
+      when: not tpl_done
+      block:
+        - name: Image directory
+          ansible.builtin.file:
+            path: "{{ alma_image_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download {{ alma_image_file }} (sha256 verified)
+          ansible.builtin.get_url:
+            url: "{{ alma_image_base_url }}/{{ alma_image_file }}"
+            dest: "{{ tpl_img }}"
+            checksum: "sha256:{{ alma_image_sha256 }}"
+            mode: "0644"
+          when: not ansible_check_mode
+
+        - name: (check mode) would download
+          ansible.builtin.debug:
+            msg: "{{ alma_image_base_url }}/{{ alma_image_file }} -> {{ tpl_img }} (sha256 {{ alma_image_sha256 }})"
+          when: ansible_check_mode
+
+        # The image only exists after a real download, so both steps are apply-only.
+        - name: Read image virtual size
+          ansible.builtin.command: qemu-img info --output json {{ tpl_img }}
+          register: tpl_imginfo
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Image must not be larger than {{ vm_disk_size }} (disks cannot shrink)
+          ansible.builtin.assert:
+            that: (tpl_imginfo.stdout | from_json)['virtual-size'] <= (vm_disk_size | human_to_bytes)
+            fail_msg: "Image virtual size {{ (tpl_imginfo.stdout | from_json)['virtual-size'] | human_readable }} > {{ vm_disk_size }}"
+            quiet: true
+          when: not ansible_check_mode
+
+        - name: SSH public key for cloud-init
+          ansible.builtin.copy:
+            content: "{{ lookup('ansible.builtin.file', ci_ssh_pubkey_file) }}\n"
+            dest: "{{ tpl_keyfile }}"
+            mode: "0644"
+
+        - name: Create VM shell {{ tpl_id }}
+          ansible.builtin.command:
+            argv:
+              - qm
+              - create
+              - "{{ tpl_id }}"
+              - --name
+              - "{{ pve_template_name }}"
+              - --tags
+              - "{{ pve_tag }}"
+              - --description
+              - "Managed by Ansible (redis-dev project). Template for VMs 270-275."
+              - --ostype
+              - "l26"
+              - --cores
+              - "{{ vm_cores }}"
+              - --cpu
+              - "{{ vm_cpu_type }}"
+              - --memory
+              - "{{ vm_memory_mb }}"
+              - --balloon
+              - "0"
+              - --scsihw
+              - "virtio-scsi-single"
+              - --net0
+              - "{{ vm_net0 }}"
+              - --agent
+              - "enabled=1"
+              - --serial0
+              - "socket"
+              - --vga
+              - "serial0"
+            creates: /etc/pve/nodes/{{ inventory_hostname }}/qemu-server/{{ tpl_id }}.conf
+
+        - name: Read current config of {{ tpl_id }}
+          ansible.builtin.command: qm config {{ tpl_id }}
+          register: tpl_cfg
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        # A running shell makes `qm set` hot-plug disks (fails) and blocks `qm template`.
+        - name: Power state of {{ tpl_id }}
+          ansible.builtin.command: qm status {{ tpl_id }}
+          register: tpl_status
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Template shell {{ tpl_id }} must be stopped
+          ansible.builtin.assert:
+            that: "'status: running' not in tpl_status.stdout"
+            fail_msg: >-
+              VM {{ tpl_id }} is running. Stop it on {{ inventory_hostname }} (qm stop {{ tpl_id }})
+              and re-run. Nothing was changed.
+            quiet: true
+
+        - name: Import image to {{ pve_storage }}
+          ansible.builtin.command: qm disk import {{ tpl_id }} {{ tpl_img }} {{ pve_storage }} --format raw
+          when: "('vm-' ~ tpl_id ~ '-disk-0') not in tpl_cfg.stdout"
+
+        - name: Attach disk as scsi0 (iothread, discard)
+          ansible.builtin.command: >-
+            qm set {{ tpl_id }}
+            --scsi0 {{ pve_storage }}:vm-{{ tpl_id }}-disk-0,iothread=1,discard=on,ssd=1
+          when: tpl_cfg.stdout is not search('(?m)^scsi0:')
+
+        - name: Add cloud-init drive (ide2)
+          ansible.builtin.command: qm set {{ tpl_id }} --ide2 {{ pve_storage }}:cloudinit
+          when: tpl_cfg.stdout is not search('(?m)^ide2:')
+
+        - name: Boot from scsi0
+          ansible.builtin.command: qm set {{ tpl_id }} --boot order=scsi0
+          when: "tpl_cfg.stdout is not search('(?m)^boot: order=scsi0$')"
+
+        - name: Resize scsi0 to {{ vm_disk_size }}
+          ansible.builtin.command: qm disk resize {{ tpl_id }} scsi0 {{ vm_disk_size }}
+          when: tpl_cfg.stdout is not search('(?m)^scsi0:.*size=' ~ vm_disk_size)
+
+        - name: Cloud-init defaults (user, password hash, keys, DNS)
+          ansible.builtin.command:
+            argv: [qm, set, "{{ tpl_id }}", --ciuser, "{{ ci_user }}", --cipassword, "{{ ci_password_hash }}",
+                   --sshkeys, "{{ tpl_keyfile }}", --nameserver, "{{ net_dns }}"]
+          no_log: true
+          when: "tpl_cfg.stdout is not search('(?m)^ciuser: ' ~ ci_user ~ '$')"
+
+        - name: Convert to template
+          ansible.builtin.command: qm template {{ tpl_id }}
+          when: "tpl_cfg.stdout is not search('(?m)^template: 1$')"
+
+    - name: Final config of {{ tpl_id }}
+      ansible.builtin.command: qm config {{ tpl_id }}
+      register: tpl_final
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Show template config
+      ansible.builtin.debug:
+        var: tpl_final.stdout_lines
+      when: tpl_final.rc == 0

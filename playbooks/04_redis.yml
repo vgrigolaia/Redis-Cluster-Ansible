@@ -1,0 +1,215 @@
+---
+# Install Redis Open Source from the official packages.redis.io repo
+# (rockylinux10 path - verified to exist and to carry redis {{ redis_version }}).
+# Play 1 installs in parallel and discovers the real layout from the package.
+# Play 2 configures and (re)starts one node at a time so a config change on a
+# running cluster is a rolling restart.
+
+- name: 04a | Install Redis package
+  hosts: redis_cluster
+  gather_facts: false
+  tasks:
+    - name: Never let dnf pick up Valkey
+      ansible.builtin.lineinfile:
+        path: /etc/dnf/dnf.conf
+        regexp: '^excludepkgs='
+        line: excludepkgs=valkey*
+        insertafter: '^\[main\]'
+
+    - name: Import Redis repo GPG key
+      ansible.builtin.rpm_key:
+        key: "{{ redis_repo_gpgkey }}"
+        state: present
+      register: rd_key
+
+    - name: Redis Open Source repo
+      ansible.builtin.yum_repository:
+        name: redis
+        description: Redis Open Source (packages.redis.io, rockylinux10)
+        baseurl: "{{ redis_repo_baseurl }}"
+        gpgcheck: true
+        gpgkey: "{{ redis_repo_gpgkey }}"
+        enabled: true
+      register: rd_repo
+
+    # In check mode the repo file is not really written, so dnf could not resolve the package.
+    - name: Repo pending (check mode only)
+      ansible.builtin.set_fact:
+        rd_repo_pending: "{{ ansible_check_mode and (rd_repo is changed or rd_key is changed) }}"
+
+    - name: (check mode) would install
+      ansible.builtin.debug:
+        msg: redis-{{ redis_version }} from {{ redis_repo_baseurl }} (repo/key not present yet)
+      when: rd_repo_pending
+
+    - name: Install redis-{{ redis_version }}
+      ansible.builtin.dnf:
+        name: redis-{{ redis_version }}
+        state: present
+      when: not rd_repo_pending
+
+    - name: Look for any Valkey package
+      ansible.builtin.command: rpm -qa 'valkey*'
+      register: rd_valkey
+      changed_when: false
+      check_mode: false
+
+    - name: Valkey must NOT be installed
+      ansible.builtin.assert:
+        that: rd_valkey.stdout | trim | length == 0
+        fail_msg: "Valkey packages found: {{ rd_valkey.stdout_lines }}"
+        quiet: true
+
+    - name: SELinux module shipped by the RPM is loaded?
+      ansible.builtin.shell: set -o pipefail; semodule -l | awk '$1=="redis-ce"'
+      register: rd_semod
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Load redis-ce SELinux module (RPM post-install skipped it)
+      ansible.builtin.shell: |
+        set -e
+        cd /usr/share/selinux/packages
+        checkmodule -M -m redis-ce.te -o /tmp/redis-ce.mod
+        semodule_package -m /tmp/redis-ce.mod -o /tmp/redis-ce.pp -f redis-ce.fc
+        semodule -i /tmp/redis-ce.pp
+        rm -f /tmp/redis-ce.mod /tmp/redis-ce.pp
+      when: rd_semod.stdout | trim | length == 0
+
+    # ---------------------------------------------------------- discovery
+    - name: Package file list
+      ansible.builtin.command: rpm -ql redis
+      register: rd_rpmql
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Effective systemd unit
+      ansible.builtin.command: systemctl cat redis.service
+      register: rd_unit
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Derive service facts from the installed package
+      ansible.builtin.set_fact:
+        redis_service: redis
+        redis_conf_path: "{{ (rd_unit.stdout | regex_search('(?m)^ExecStart=\\S+ (\\S+)', '\\1') or ['/etc/redis/redis.conf'])[0] }}"
+        redis_user: "{{ (rd_unit.stdout | regex_search('(?m)^User=(\\S+)', '\\1') or ['redis'])[0] }}"
+        redis_data_dir: "{{ '/var/lib/redis' if '/var/lib/redis' in rd_rpmql.stdout_lines or rd_rpmql.rc != 0 else 'UNKNOWN' }}"
+        redis_log_dir: "{{ '/var/log/redis' if '/var/log/redis' in rd_rpmql.stdout_lines or rd_rpmql.rc != 0 else 'UNKNOWN' }}"
+
+    - name: Discovered layout
+      ansible.builtin.debug:
+        msg:
+          - "service={{ redis_service }}.service user={{ redis_user }}"
+          - "config={{ redis_conf_path }} data={{ redis_data_dir }} logs={{ redis_log_dir }}"
+          - "unit: {{ rd_unit.stdout_lines | select('match', '^(ExecStart|User|Type|LimitNOFILE|ReadWrite)') | list }}"
+      run_once: true
+
+    - name: Layout must be known
+      ansible.builtin.assert:
+        that:
+          - redis_data_dir != 'UNKNOWN'
+          - redis_log_dir != 'UNKNOWN'
+        quiet: true
+
+- name: 04b | Configure and start Redis (rolling, one node at a time)
+  hosts: redis_cluster
+  gather_facts: false
+  serial: 1
+  handlers:
+    - name: Restart redis
+      ansible.builtin.systemd_service:
+        name: "{{ redis_service }}"
+        state: restarted
+        daemon_reload: true
+  tasks:
+    - name: Note (check mode, package not installed yet)
+      ansible.builtin.debug:
+        msg: redis is not installed yet, so config/service tasks are skipped in check mode.
+      when: ansible_check_mode and rd_unit.rc != 0
+
+    - name: Configure redis
+      when: rd_unit.rc == 0 or not ansible_check_mode
+      block:
+        - name: Back up original package config (once)
+          ansible.builtin.copy:
+            src: "{{ redis_conf_path }}"
+            dest: "{{ redis_conf_path }}.orig"
+            remote_src: true
+            force: false
+            owner: "{{ redis_user }}"
+            group: "{{ redis_user }}"
+            mode: "0640"
+
+        - name: redis.conf from template
+          ansible.builtin.template:
+            src: redis.conf.j2
+            dest: "{{ redis_conf_path }}"
+            owner: "{{ redis_user }}"
+            group: "{{ redis_user }}"
+            mode: "0640"
+          no_log: "{{ redis_password | length > 0 }}"
+          notify: Restart redis
+
+        - name: Data / log dirs owned by {{ redis_user }}
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "{{ redis_user }}"
+            group: "{{ redis_user }}"
+            mode: "0750"
+          loop:
+            - "{{ redis_data_dir }}"
+            - "{{ redis_log_dir }}"
+
+        - name: Restore SELinux labels
+          ansible.builtin.command: restorecon -Rv /etc/redis {{ redis_data_dir }} {{ redis_log_dir }}
+          register: rd_restorecon
+          changed_when: rd_restorecon.stdout | trim | length > 0
+
+        - name: Redis enabled and running
+          ansible.builtin.systemd_service:
+            name: "{{ redis_service }}"
+            state: started
+            enabled: true
+
+    - name: Apply pending restart now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for PONG
+      ansible.builtin.command: redis-cli -h {{ ip }} -p {{ redis_port }} ping
+      environment: "{{ redis_cli_env }}"
+      register: rd_ping
+      until: rd_ping.stdout == 'PONG'
+      retries: 20
+      delay: 3
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: SELinux denials for redis since boot
+      ansible.builtin.command: ausearch -m AVC,USER_AVC -c redis-server -ts boot
+      register: rd_avc
+      changed_when: false
+      check_mode: false
+      failed_when: rd_avc.rc == 0      # rc 0 = denials found, rc 1 = none
+
+    - name: redis-server --version
+      ansible.builtin.command: redis-server --version
+      register: rd_version
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Must be Redis {{ redis_version }} (not Valkey)
+      ansible.builtin.assert:
+        that: rd_version.stdout is search('^Redis server v=' ~ (redis_version | regex_escape) ~ ' ')
+        fail_msg: "Unexpected: {{ rd_version.stdout | default('') }}"
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ rd_version.stdout | default('not installed yet') }}"

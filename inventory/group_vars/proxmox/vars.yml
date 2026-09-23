@@ -1,0 +1,4 @@
+---
+# IdentityAgent=SSH_AUTH_SOCK: ~/.ssh/config's `Host *` points at the 1Password
+# agent, which doesn't hold the Proxmox key; use the ssh-agent from the shell instead.
+ansible_ssh_common_args: -o IdentityAgent=SSH_AUTH_SOCK

@@ -1,0 +1,11 @@
+---
+- name: Template
+  ansible.builtin.import_playbook: playbooks/01_template.yml
+- name: VMs
+  ansible.builtin.import_playbook: playbooks/02_vms.yml
+- name: OS
+  ansible.builtin.import_playbook: playbooks/03_os.yml
+- name: Redis
+  ansible.builtin.import_playbook: playbooks/04_redis.yml
+- name: Cluster
+  ansible.builtin.import_playbook: playbooks/05_cluster.yml

@@ -1,0 +1,214 @@
+---
+- name: 03 | OS tuning for Redis
+  hosts: redis_cluster
+  gather_facts: false
+  handlers:
+    - name: Reboot for kernel cmdline
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      throttle: 1          # one VM at a time - never take the whole cluster down
+  tasks:
+    - name: Wait for SSH / Python
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        sleep: 15          # slow retries: OpenSSH 9.9 PerSourcePenalties locks out fast retriers
+      check_mode: false    # read-only; makes --check fail fast on SSH problems
+
+    - name: Wait for cloud-init to finish (it may still hold the dnf lock)
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Must be AlmaLinux 10
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'AlmaLinux'
+          - ansible_facts.distribution_major_version == '10'
+        quiet: true
+
+    - name: SAFETY - this host must be our VM (QEMU guest, cloud-init hostname = VM name)
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.system_vendor == 'QEMU'
+          - ansible_facts.hostname == inventory_hostname
+        fail_msg: >-
+          {{ ansible_host }} answers as '{{ ansible_facts.hostname }}' ({{ ansible_facts.system_vendor }}),
+          expected {{ inventory_hostname }} - possible IP conflict. Nothing changed on this host.
+        quiet: true
+
+    - name: Hostname = VM name
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Password for {{ ci_user }} (hash from vault; console login, SSH stays key-only)
+      ansible.builtin.user:
+        name: "{{ ci_user }}"
+        password: "{{ ci_password_hash }}"
+        update_password: always
+      no_log: true
+
+    - name: Base packages (guest agent, firewalld, SELinux tooling needed by the redis RPM)
+      ansible.builtin.dnf:
+        name:
+          - qemu-guest-agent
+          - firewalld
+          - policycoreutils
+          - policycoreutils-python-utils
+          - checkpolicy
+          - python3-firewall
+        state: present
+      register: os_pkgs
+
+    - name: Packages pending (check mode only)
+      ansible.builtin.set_fact:
+        os_pkgs_pending: "{{ ansible_check_mode and os_pkgs is changed }}"
+
+    - name: Note
+      ansible.builtin.debug:
+        msg: Check mode - packages above are not installed yet, so firewalld/semanage tasks are skipped in this plan.
+      when: os_pkgs_pending
+
+    - name: qemu-guest-agent running
+      ansible.builtin.systemd_service:
+        name: qemu-guest-agent
+        state: started
+        enabled: true
+
+    # ------------------------------------------------------------ sysctl
+    - name: Kernel parameters for Redis
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/90-redis.conf
+        reload: true
+      loop: "{{ {'vm.overcommit_memory': '1', 'net.core.somaxconn': '4096'} | dict2items }}"
+
+    # ------------------------------------------------------------ THP
+    - name: Read kernel args of all boot entries
+      ansible.builtin.command: grubby --info=ALL
+      register: os_grubby
+      changed_when: false
+      check_mode: false
+
+    - name: THP plan
+      ansible.builtin.debug:
+        msg: >-
+          transparent_hugepage=never present on
+          {{ os_grubby.stdout_lines | select('match', '^args=.*transparent_hugepage=never') | list | length }}/{{ os_grubby.stdout_lines | select('match', '^args=') | list | length }}
+          boot entries{{ '' if (os_grubby.stdout_lines | select('match', '^args=') | list | length) == (os_grubby.stdout_lines | select('match', '^args=.*transparent_hugepage=never') | list | length) else ' -> will add it and REBOOT once' }}
+
+    - name: Disable Transparent Huge Pages persistently (all kernels)
+      ansible.builtin.command: grubby --update-kernel=ALL --args=transparent_hugepage=never
+      when: >-
+        (os_grubby.stdout_lines | select('match', '^args=') | list | length) !=
+        (os_grubby.stdout_lines | select('match', '^args=.*transparent_hugepage=never') | list | length)
+      notify: Reboot for kernel cmdline
+
+    # Args can already be on disk while the running kernel lacks them (e.g. a
+    # previous run failed before its reboot), so also check the live cmdline.
+    - name: Running kernel cmdline
+      ansible.builtin.command: cat /proc/cmdline
+      register: os_cmdline
+      changed_when: false
+      check_mode: false
+
+    - name: Reboot still pending (running kernel has THP enabled)
+      ansible.builtin.debug:
+        msg: transparent_hugepage=never is not active yet -> REBOOT
+      changed_when: true
+      when: "'transparent_hugepage=never' not in os_cmdline.stdout"
+      notify: Reboot for kernel cmdline
+
+    # ------------------------------------------------------------ limits
+    - name: systemd drop-in dir for redis.service
+      ansible.builtin.file:
+        path: /etc/systemd/system/redis.service.d
+        state: directory
+        mode: "0755"
+
+    - name: LimitNOFILE drop-in
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/redis.service.d/limits.conf
+        content: |
+          # Managed by Ansible
+          [Service]
+          LimitNOFILE=65535
+        mode: "0644"
+      register: os_dropin
+
+    - name: systemd daemon-reload
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: os_dropin is changed
+
+    # ------------------------------------------------------------ firewalld
+    - name: firewalld running
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: started
+        enabled: true
+      when: not os_pkgs_pending
+
+    # systemd returns before firewalld is ready on D-Bus; rules added too early fail.
+    - name: Wait until firewalld answers
+      ansible.builtin.command: firewall-cmd --state
+      register: os_fwstate
+      until: os_fwstate.stdout == 'running'
+      retries: 15
+      delay: 2
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: not os_pkgs_pending
+
+    - name: Allow Redis ports only from {{ net_cidr }}
+      ansible.posix.firewalld:
+        rich_rule: rule family="ipv4" source address="{{ net_cidr }}" port port="{{ item }}" protocol="tcp" accept
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - "{{ redis_port }}"
+        - "{{ redis_bus_port }}"
+      when: not os_pkgs_pending
+
+    # ------------------------------------------------------------ SELinux
+    - name: SELinux must stay enforcing
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.selinux.status == 'enabled'
+          - ansible_facts.selinux.mode == 'enforcing'
+          - ansible_facts.selinux.config_mode == 'enforcing'
+        fail_msg: SELinux is not enforcing on {{ inventory_hostname }} - fix manually, do not disable.
+        quiet: true
+
+    - name: Read SELinux redis port labels
+      ansible.builtin.shell: set -o pipefail; semanage port -l | awk '$1=="redis_port_t"'
+      register: os_seports
+      changed_when: false
+      check_mode: false
+      when: not os_pkgs_pending
+
+    - name: Label Redis ports as redis_port_t if missing
+      ansible.builtin.command: semanage port -a -t redis_port_t -p tcp {{ item }}
+      loop:
+        - "{{ redis_port }}"
+        - "{{ redis_bus_port }}"
+      when: not os_pkgs_pending and (os_seports.stdout is not search('\\b' ~ item ~ '\\b'))
+
+    - name: Flush handlers (reboot now if THP args changed)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Runtime THP state
+      ansible.builtin.command: cat /sys/kernel/mm/transparent_hugepage/enabled
+      register: os_thp
+      changed_when: false
+      check_mode: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "THP={{ os_thp.stdout }} | kernel={{ ansible_facts.kernel }} | SELinux={{ ansible_facts.selinux.mode }}"

@@ -1,0 +1,67 @@
+---
+# Read-only safety checks, run on a Proxmox node. Fails if any VMID we manage
+# is occupied by something that is NOT ours (wrong name or missing tag).
+# Sets: pf_existing  = {vmid: resource} for managed VMIDs that already exist.
+
+- name: Preflight | read cluster VM list (read-only)
+  ansible.builtin.command: pvesh get /cluster/resources --type vm --output-format json
+  register: pf_res
+  changed_when: false
+  check_mode: false
+
+- name: Preflight | build expected VMID -> name / node maps
+  ansible.builtin.set_fact:
+    pf_expected_name: >-
+      {{ dict(groups['redis_cluster'] | map('extract', hostvars, 'vmid')
+              | zip(groups['redis_cluster']))
+         | combine({pve_template_vmid: pve_template_name}) }}
+    pf_expected_node: >-
+      {{ dict(groups['redis_cluster'] | map('extract', hostvars, 'vmid')
+              | zip(groups['redis_cluster'] | map('extract', hostvars, 'pve_node')))
+         | combine({pve_template_vmid: pve_template_node}) }}
+    pf_managed: "{{ pf_res.stdout | from_json | selectattr('vmid', 'in', pve_managed_vmids) | list }}"
+
+- name: Preflight | index existing managed VMIDs
+  ansible.builtin.set_fact:
+    pf_existing: "{{ dict(pf_managed | map(attribute='vmid') | zip(pf_managed)) }}"
+
+- name: Preflight | ABORT if a managed VMID is used by a foreign VM/template
+  ansible.builtin.assert:
+    that:
+      - item.name == pf_expected_name[item.vmid]
+      - pve_tag in (item.tags | default('')).split(';')
+      - item.node == pf_expected_node[item.vmid]
+    fail_msg: >-
+      VMID {{ item.vmid }} is in use by '{{ item.name }}' on {{ item.node }}
+      (tags='{{ item.tags | default('') }}'). Expected '{{ pf_expected_name[item.vmid] }}'
+      on {{ pf_expected_node[item.vmid] }} tagged '{{ pve_tag }}'. STOPPING - nothing was changed.
+    quiet: true
+  loop: "{{ pf_managed }}"
+  loop_control:
+    label: "{{ item.vmid }} {{ item.name }}"
+
+- name: Preflight | storage {{ pve_storage }} exists and holds VM images
+  ansible.builtin.command: pvesh get /storage/{{ pve_storage }} --output-format json
+  register: pf_storage
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    pf_storage.rc != 0 or 'images' not in (pf_storage.stdout | from_json).content.split(',')
+
+# The config check above passes even when Ceph auth is broken; listing needs a real login.
+- name: Preflight | storage {{ pve_storage }} is usable (list content, read-only)
+  ansible.builtin.command: pvesm list {{ pve_storage }}
+  changed_when: false
+  check_mode: false
+
+- name: Preflight | bridge {{ pve_bridge }} exists on every node
+  ansible.builtin.command: pvesh get /nodes/{{ item }}/network/{{ pve_bridge }} --output-format json
+  loop: "{{ groups['proxmox'] }}"
+  changed_when: false
+  check_mode: false
+
+- name: Preflight | summary
+  ansible.builtin.debug:
+    msg: >-
+      Managed VMIDs already present (ours): {{ pf_existing.keys() | list | sort }};
+      free: {{ pve_managed_vmids | difference(pf_existing.keys() | list) | sort }}

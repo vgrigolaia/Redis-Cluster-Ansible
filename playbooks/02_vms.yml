@@ -1,0 +1,193 @@
+---
+# Full-clone the 6 Redis VMs from template 9010 directly onto their target node
+# (qm clone --target works because the disks live on shared Ceph), then
+# configure/verify/start each VM on its own node (qm is node-local, so those
+# tasks are delegated to hostvars[item].pve_node). Existing VMs are never
+# recreated; they are only re-configured if their ipconfig0 drifted.
+- name: 02 | Clone and start Redis VMs
+  hosts: pve_template
+  gather_facts: false
+  vars:
+    vms: "{{ groups['redis_cluster'] }}"
+  tasks:
+    - name: Safety preflight
+      ansible.builtin.import_tasks: tasks/preflight.yml
+
+    - name: Template state
+      ansible.builtin.set_fact:
+        tpl_ok: "{{ (pf_existing[pve_template_vmid].template | default(0) | int) == 1 }}"
+
+    - name: Template {{ pve_template_vmid }} must exist before cloning
+      ansible.builtin.assert:
+        that: tpl_ok
+        fail_msg: Template {{ pve_template_vmid }} not found - run playbooks/01_template.yml first.
+      when: not ansible_check_mode
+
+    - name: Note (check mode without template)
+      ansible.builtin.debug:
+        msg: Template {{ pve_template_vmid }} does not exist yet; clone/config steps below are shown as planned only.
+      when: ansible_check_mode and not tpl_ok
+
+    # Ping is not proof (hosts may drop ICMP). ARP duplicate-address detection
+    # from the target node's bridge catches any L2 neighbour already using the IP.
+    - name: IP conflict probe (arping -D) for VMs not yet running
+      ansible.builtin.shell: |
+        command -v arping >/dev/null || { echo NO_ARPING; exit 0; }
+        arping -V 2>&1 | grep -q iputils || { echo NOT_IPUTILS; exit 0; }
+        arping -D -q -c 3 -w 4 -I {{ pve_bridge }} {{ hostvars[item].ip }}; rc=$?
+        case $rc in 0) echo FREE;; 1) echo IN_USE;; *) echo "ERROR_rc$rc";; esac
+      delegate_to: "{{ hostvars[item].pve_node }}"
+      register: vm_dad
+      loop: "{{ vms }}"
+      when: (pf_existing[hostvars[item].vmid].status | default('absent')) != 'running'
+      changed_when: false
+      check_mode: false
+      loop_control:
+        label: "{{ item }} {{ hostvars[item].ip }}"
+
+    - name: ABORT if an IP is already used on the network
+      ansible.builtin.assert:
+        that:
+          - r.stdout != 'IN_USE'
+          - r.stdout is not match('ERROR')
+        fail_msg: >-
+          {{ r.item }}: {{ (hostvars[r.item].ip ~ ' answers ARP - already used by another host. Pick another IP.')
+          if r.stdout == 'IN_USE' else ('arping failed (' ~ r.stdout ~ ') on ' ~ hostvars[r.item].pve_node ~ ' - check that ' ~ pve_bridge ~ ' exists.') }}
+          Nothing was changed.
+        quiet: true
+      loop: "{{ vm_dad.results | selectattr('stdout', 'defined') | list }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item }} {{ hostvars[r.item].ip }}: {{ r.stdout }}"
+
+    - name: Warn if the ARP probe could not run
+      ansible.builtin.debug:
+        msg: "WARNING {{ r.item }}: IP conflict probe skipped ({{ r.stdout }}) - install iputils-arping on {{ hostvars[r.item].pve_node }}"
+      loop: "{{ vm_dad.results | selectattr('stdout', 'defined') | selectattr('stdout', 'in', ['NO_ARPING', 'NOT_IPUTILS']) | list }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item }}"
+
+    - name: Full-clone template -> VM on its target node
+      ansible.builtin.command: >-
+        qm clone {{ pve_template_vmid }} {{ hostvars[item].vmid }}
+        --name {{ item }} --full 1
+        --target {{ hostvars[item].pve_node }}
+        --storage {{ pve_storage }}
+      loop: "{{ vms }}"
+      when: hostvars[item].vmid not in pf_existing
+      loop_control:
+        label: "{{ hostvars[item].vmid }} {{ item }} -> {{ hostvars[item].pve_node }}"
+
+    - name: Read VM config (on owning node)
+      ansible.builtin.command: qm config {{ hostvars[item].vmid }}
+      delegate_to: "{{ hostvars[item].pve_node }}"
+      register: vm_cfg
+      loop: "{{ vms }}"
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].vmid }} {{ item }}"
+
+    - name: Set cloud-init network, user, DNS, tag, onboot
+      ansible.builtin.command: >-
+        qm set {{ hostvars[r.item].vmid }}
+        --ipconfig0 ip={{ hostvars[r.item].ip }}/{{ net_prefix }},gw={{ net_gateway }}
+        --nameserver {{ net_dns }}
+        --ciuser {{ ci_user }}
+        --tags {{ pve_tag }}
+        --onboot 1
+      delegate_to: "{{ hostvars[r.item].pve_node }}"
+      loop: "{{ vm_cfg.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ hostvars[r.item].vmid }} {{ r.item }} ip={{ hostvars[r.item].ip }}"
+      when: >-
+        r.stdout is not search('(?m)^ipconfig0: .*ip=' ~ (hostvars[r.item].ip | regex_escape) ~ '/' ~ net_prefix ~ '(,|$)')
+        or r.stdout is not search('(?m)^ipconfig0: .*gw=' ~ (net_gateway | regex_escape) ~ '(,|$)')
+
+    - name: Set cloud-init password hash for {{ ci_user }} (console login)
+      ansible.builtin.command:
+        argv: [qm, set, "{{ hostvars[r.item].vmid }}", --cipassword, "{{ ci_password_hash }}"]
+      delegate_to: "{{ hostvars[r.item].pve_node }}"
+      loop: "{{ vm_cfg.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ hostvars[r.item].vmid }} {{ r.item }}"
+      when: r.stdout is not search('(?m)^cipassword:')
+      no_log: true
+
+    - name: Verify generated cloud-init network config
+      ansible.builtin.command: qm cloudinit dump {{ hostvars[item].vmid }} network
+      delegate_to: "{{ hostvars[item].pve_node }}"
+      register: vm_cidump
+      loop: "{{ vms }}"
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].vmid }} {{ item }}"
+
+    - name: Cloud-init must contain the right IP, netmask, gateway and DNS
+      ansible.builtin.assert:
+        that:
+          - ci_subnet.type == 'static'
+          - ci_subnet.address == hostvars[r.item].ip
+          - ci_subnet.netmask == net_netmask
+          - ci_subnet.gateway == net_gateway
+          - net_dns in ci_dns
+        fail_msg: "{{ r.item }}: unexpected cloud-init network config:\n{{ r.stdout }}"
+        quiet: true
+      loop: "{{ vm_cidump.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.item }} {{ ci_subnet.address | default('?') }}/{{ ci_subnet.netmask | default('?') }} gw {{ ci_subnet.gateway | default('?') }}"
+      vars:
+        ci_cfg: "{{ (r.stdout | from_yaml).config if r.rc == 0 else [] }}"
+        ci_subnet: "{{ (ci_cfg | selectattr('type', 'equalto', 'physical') | first).subnets | first if r.rc == 0 else {} }}"
+        ci_dns: "{{ (ci_cfg | selectattr('type', 'equalto', 'nameserver') | first).address if r.rc == 0 else [] }}"
+      when: r.rc == 0
+
+    - name: Read VM power state
+      ansible.builtin.command: qm status {{ hostvars[item].vmid }}
+      delegate_to: "{{ hostvars[item].pve_node }}"
+      register: vm_status
+      loop: "{{ vms }}"
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].vmid }} {{ item }}"
+
+    - name: Start VM
+      ansible.builtin.command: qm start {{ hostvars[r.item].vmid }}
+      delegate_to: "{{ hostvars[r.item].pve_node }}"
+      loop: "{{ vm_status.results }}"
+      loop_control:
+        loop_var: r
+        label: "{{ hostvars[r.item].vmid }} {{ r.item }} ({{ r.stdout | default('absent') }})"
+      when: "'status: running' not in r.stdout"
+
+    - name: Wait for SSH on each VM IP
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].ip }}"
+        port: 22
+        search_regex: OpenSSH
+        timeout: 600
+      delegate_to: localhost
+      loop: "{{ vms }}"
+      when: not ansible_check_mode
+
+    - name: Placement after run (read-only)
+      ansible.builtin.command: pvesh get /cluster/resources --type vm --output-format json
+      register: vm_after
+      changed_when: false
+      check_mode: false
+
+    - name: Placement table
+      ansible.builtin.debug:
+        msg: "{{ item.vmid }} | {{ item.name }} | {{ item.node }} | {{ item.status }}"
+      loop: "{{ vm_after.stdout | from_json | selectattr('vmid', 'in', pve_managed_vmids) | sort(attribute='vmid') }}"
+      loop_control:
+        label: "{{ item.vmid }}"

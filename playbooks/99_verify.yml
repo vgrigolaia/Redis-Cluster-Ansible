@@ -1,0 +1,220 @@
+---
+# Health checks (read-only, plus a few temporary test keys).
+# Optional failover test - only with:  -e run_failover_test=true
+#   stops VM 270 (redis-dev-01) on its Proxmox node, confirms redis-dev-05 is
+#   promoted, starts 270 again, then CLUSTER FAILOVER on 270 restores the layout.
+
+- name: 99a | Verify cluster health and placement
+  hosts: redis_cluster[0]
+  gather_facts: false
+  environment: "{{ redis_cli_env }}"
+  vars:
+    cli: redis-cli -p {{ redis_port }}
+    ip_to_host: "{{ dict(groups['redis_cluster'] | map('extract', hostvars, 'ip') | zip(groups['redis_cluster'])) }}"
+  tasks:
+    - name: cluster info
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster info"
+      register: vf_info
+      changed_when: false
+      check_mode: false
+
+    - name: cluster nodes
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster nodes"
+      register: vf_nodes
+      changed_when: false
+      check_mode: false
+
+    - name: Parse
+      ansible.builtin.set_fact:
+        vf_list: "{{ vf_nodes.stdout_lines | map('split') | list }}"
+        vf_by_id: "{{ dict(vf_nodes.stdout_lines | map('split') | map('first') | zip(vf_nodes.stdout_lines | map('split'))) }}"
+
+    - name: Build placement rows
+      ansible.builtin.set_fact:
+        vf_rows: "{{ vf_rows | default([]) + [row] }}"
+      loop: "{{ vf_list }}"
+      loop_control:
+        label: "{{ item[1] }}"
+      vars:
+        h: "{{ ip_to_host[item[1] | regex_replace(':.*$', '')] }}"
+        is_master: "{{ 'master' in item[2] }}"
+        mh: "{{ '' if is_master else ip_to_host[vf_by_id[item[3]][1] | regex_replace(':.*$', '')] }}"
+        row:
+          host: "{{ h }}"
+          vmid: "{{ hostvars[h].vmid }}"
+          pve_node: "{{ hostvars[h].pve_node }}"
+          role: "{{ 'master' if is_master else 'replica' }}"
+          slots: "{{ item[8:] | join(' ') }}"
+          master: "{{ mh }}"
+          master_pve_node: "{{ hostvars[mh].pve_node if mh else '' }}"
+          link: "{{ item[7] }}"
+
+    - name: Assertions
+      ansible.builtin.assert:
+        that:
+          - "'cluster_state:ok' in vf_info.stdout"
+          - "'cluster_slots_assigned:16384' in vf_info.stdout"
+          - "'cluster_slots_ok:16384' in vf_info.stdout"
+          - "'cluster_known_nodes:6' in vf_info.stdout"
+          - "'cluster_size:3' in vf_info.stdout"
+          - vf_rows | selectattr('role', 'equalto', 'master') | list | length == 3
+          - vf_rows | selectattr('role', 'equalto', 'replica') | list | length == 3
+          - vf_rows | selectattr('link', 'equalto', 'connected') | list | length == 6
+          - vf_rows | selectattr('role', 'equalto', 'replica') | rejectattr('master_pve_node', 'equalto', '') | list | length == 3
+        quiet: true
+
+    - name: Each replica's master is on a DIFFERENT Proxmox host
+      ansible.builtin.assert:
+        that: item.pve_node != item.master_pve_node
+        fail_msg: "{{ item.host }} ({{ item.pve_node }}) replicates {{ item.master }} on the SAME host!"
+        quiet: true
+      loop: "{{ vf_rows | selectattr('role', 'equalto', 'replica') | list }}"
+      loop_control:
+        label: "{{ item.host }}@{{ item.pve_node }} -> {{ item.master }}@{{ item.master_pve_node }}"
+
+    - name: Placement table (VM -> Proxmox host -> role)
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.vmid }} {{ item.host }} | {{ item.pve_node }} | {{ item.role }}
+          {{- (' slots ' ~ item.slots) if item.role == 'master' else (' of ' ~ item.master ~ ' (' ~ item.master_pve_node ~ ')') }}
+      loop: "{{ vf_rows | sort(attribute='host') }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+    - name: SET via cluster-aware client (-c) - keys spread over all shards
+      ansible.builtin.command: "{{ cli }} -c -h {{ ip }} set verify:{{ item }} {{ item }}-ok EX 300"
+      loop: [alpha, bravo, charlie, delta, echo, foxtrot]
+      register: vf_set
+      changed_when: false
+      failed_when: vf_set.stdout != 'OK'
+
+    - name: GET the same keys from a different node
+      ansible.builtin.command: "{{ cli }} -c -h {{ hostvars[groups['redis_cluster'][-1]].ip }} get verify:{{ item }}"
+      loop: [alpha, bravo, charlie, delta, echo, foxtrot]
+      register: vf_get
+      changed_when: false
+      failed_when: vf_get.stdout != item ~ '-ok'
+
+    - name: Key -> slot -> node
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster keyslot verify:{{ item }}"
+      loop: [alpha, bravo, charlie, delta, echo, foxtrot]
+      register: vf_slot
+      changed_when: false
+
+    - name: Clean up test keys
+      ansible.builtin.command: "{{ cli }} -c -h {{ ip }} del verify:{{ item }}"
+      loop: [alpha, bravo, charlie, delta, echo, foxtrot]
+      changed_when: false
+
+    - name: redis-server --version
+      ansible.builtin.command: redis-server --version
+      register: vf_version
+      changed_when: false
+      check_mode: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "{{ vf_version.stdout }}"
+          - "set/get OK, keys landed in slots {{ vf_slot.results | map(attribute='stdout') | list }}"
+          - "Seeds: {{ groups['redis_cluster'] | map('extract', hostvars, 'ip') | map('regex_replace', '$', ':' ~ redis_port) | join(',') }}"
+
+# ---------------------------------------------------------------- failover
+- name: 99b | Failover test (VM 270 hard stop)
+  hosts: pve_template
+  gather_facts: false
+  vars:
+    fo_victim: redis-dev-01
+    fo_replica: redis-dev-05
+    fo_observer: redis-dev-02
+    cli: redis-cli -p {{ redis_port }}
+  tasks:
+    - name: Skip unless explicitly requested
+      ansible.builtin.meta: end_play
+      when: not (run_failover_test | default(false) | bool)
+
+    - name: Safety - victim must be one of our VMIDs
+      ansible.builtin.assert:
+        that: hostvars[fo_victim].vmid in pve_managed_vmids and hostvars[fo_victim].vmid != pve_template_vmid
+        quiet: true
+
+    - name: Safety - VMID name on Proxmox must match
+      ansible.builtin.command: qm config {{ hostvars[fo_victim].vmid }}
+      delegate_to: "{{ hostvars[fo_victim].pve_node }}"
+      register: fo_cfg
+      changed_when: false
+      check_mode: false
+      failed_when: "fo_cfg.stdout is not search('(?m)^name: ' ~ fo_victim ~ '$')"
+
+    - name: Pre-check - victim is master, replica is its slave
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_victim].ip }} role"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_role0
+      changed_when: false
+      failed_when: fo_role0.stdout_lines[0] != 'master' or hostvars[fo_replica].ip not in fo_role0.stdout
+
+    - name: Hard stop VM {{ hostvars[fo_victim].vmid }}
+      ansible.builtin.command: qm stop {{ hostvars[fo_victim].vmid }}
+      delegate_to: "{{ hostvars[fo_victim].pve_node }}"
+
+    - name: Wait for {{ fo_replica }} to be promoted
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_replica].ip }} role"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_role1
+      until: fo_role1.stdout_lines[0] == 'master'
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Cluster still ok with one node down
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_observer].ip }} cluster info"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_info
+      until: "'cluster_state:ok' in fo_info.stdout"
+      retries: 15
+      delay: 2
+      changed_when: false
+
+    - name: Start VM {{ hostvars[fo_victim].vmid }} again
+      ansible.builtin.command: qm start {{ hostvars[fo_victim].vmid }}
+      delegate_to: "{{ hostvars[fo_victim].pve_node }}"
+
+    - name: Wait until {{ fo_victim }} rejoined as replica with link up
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_victim].ip }} info replication"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_repl
+      until: "'role:slave' in fo_repl.stdout and 'master_link_status:up' in fo_repl.stdout"
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: CLUSTER FAILOVER on {{ fo_victim }} (restore original layout)
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_victim].ip }} cluster failover"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+
+    - name: Wait for {{ fo_victim }} to be master again
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[fo_victim].ip }} role"
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_role2
+      until: fo_role2.stdout_lines[0] == 'master'
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Final --cluster check
+      ansible.builtin.command: redis-cli --cluster check {{ hostvars[fo_victim].ip }}:{{ redis_port }}
+      delegate_to: "{{ fo_observer }}"
+      environment: "{{ redis_cli_env }}"
+      register: fo_check
+      changed_when: false
+      failed_when: fo_check.rc != 0 or '[ERR]' in fo_check.stdout
+
+    - name: Failover test result
+      ansible.builtin.debug:
+        var: fo_check.stdout_lines

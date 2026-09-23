@@ -1,0 +1,184 @@
+---
+# Create the cluster from redis-dev-01 only.
+#   * healthy cluster (state ok + 16384 slots)     -> no create
+#   * all 3 masters fresh (1 known node, 0 slots)  -> create with masters only
+#   * anything else                                -> STOP (manual attention)
+# Replicas are then attached explicitly per shard (see inventory `shard`).
+# A shard is considered OK in either direction (master->replica or, after a
+# failover, replica->master), so re-running never "fixes" a legitimate failover.
+- name: 05 | Build Redis Cluster (3 masters + 3 explicit replicas)
+  hosts: redis_cluster[0]
+  gather_facts: false
+  environment: "{{ redis_cli_env }}"
+  vars:
+    cl_masters: "{{ groups['redis_cluster'] | map('extract', hostvars) | selectattr('role', 'equalto', 'master') | map(attribute='inventory_hostname') | list }}"
+    cl_replicas: "{{ groups['redis_cluster'] | map('extract', hostvars) | selectattr('role', 'equalto', 'replica') | map(attribute='inventory_hostname') | list }}"
+    cl_shard_master: "{{ dict(cl_masters | map('extract', hostvars, 'shard') | zip(cl_masters)) }}"
+    cli: redis-cli -p {{ redis_port }}
+  tasks:
+    - name: Placement sanity - a replica never shares a Proxmox host with its master
+      ansible.builtin.assert:
+        that: hostvars[item].pve_node != hostvars[cl_shard_master[hostvars[item].shard]].pve_node
+        fail_msg: "{{ item }} and its master share {{ hostvars[item].pve_node }} - fix inventory."
+        quiet: true
+      loop: "{{ cl_replicas }}"
+
+    - name: cluster info on every node (read-only)
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[item].ip }} cluster info"
+      register: cl_info_all
+      loop: "{{ groups['redis_cluster'] }}"
+      changed_when: false
+      check_mode: false
+
+    - name: dbsize on every node (read-only)
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[item].ip }} dbsize"
+      register: cl_dbsize_all
+      loop: "{{ groups['redis_cluster'] }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Parse per-node state
+      ansible.builtin.set_fact:
+        cl_node: >-
+          {{ cl_node | default({}) | combine({item.item: {
+               'state': item.stdout | regex_search('cluster_state:(\w+)', '\1') | first,
+               'slots': item.stdout | regex_search('cluster_slots_assigned:(\d+)', '\1') | first | int,
+               'known': item.stdout | regex_search('cluster_known_nodes:(\d+)', '\1') | first | int,
+               'dbsize': cl_dbsize_all.results[idx].stdout | int }}) }}
+      loop: "{{ cl_info_all.results }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.item }}"
+
+    - name: Decide
+      ansible.builtin.set_fact:
+        cl_healthy: "{{ cl_node[inventory_hostname].state == 'ok' and cl_node[inventory_hostname].slots == 16384 }}"
+        cl_fresh: "{{ cl_masters | map('extract', cl_node) | selectattr('known', 'equalto', 1) | selectattr('slots', 'equalto', 0) | list | length == cl_masters | length }}"
+
+    - name: Cluster status
+      ansible.builtin.debug:
+        msg:
+          - "per-node: {{ cl_node }}"
+          - "healthy={{ cl_healthy }} fresh={{ cl_fresh }} -> {{ 'SKIP create' if cl_healthy else ('CREATE with ' ~ cl_masters | join(', ')) if cl_fresh else 'STOP' }}"
+
+    - name: STOP on partial / unknown cluster state
+      ansible.builtin.fail:
+        msg: Cluster is neither healthy nor fresh - inspect manually (redis-cli --cluster check {{ ip }}:{{ redis_port }}). Nothing changed.
+      when: not cl_healthy and not cl_fresh
+
+    # ------------------------------------------------------------ a) create
+    - name: Create cluster with the 3 masters only (--cluster-replicas 0)
+      ansible.builtin.command: >-
+        redis-cli --cluster create
+        {% for m in cl_masters %}{{ hostvars[m].ip }}:{{ redis_port }} {% endfor %}
+        --cluster-replicas 0 --cluster-yes
+      register: cl_create
+      when: cl_fresh and not cl_healthy
+      no_log: "{{ redis_password | length > 0 }}"
+
+    - name: Wait for cluster_state:ok after create
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster info"
+      register: cl_wait
+      until: "'cluster_state:ok' in cl_wait.stdout"
+      retries: 30
+      delay: 2
+      changed_when: false
+      when: cl_create is changed
+
+    # ------------------------------------------------------------ b) node IDs
+    - name: Read cluster nodes
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster nodes"
+      register: cl_nodes_raw
+      changed_when: false
+      check_mode: false
+
+    # fields: 0=id 1=ip:port@bus 2=flags 3=master-id ... 8+=slot ranges
+    - name: Index cluster nodes by IP
+      ansible.builtin.set_fact:
+        cl_by_ip: >-
+          {{ dict(cl_nodes_raw.stdout_lines | map('split') | map(attribute='1') | map('regex_replace', ':.*$', '')
+                  | zip(cl_nodes_raw.stdout_lines | map('split'))) }}
+
+    - name: Classify each shard
+      ansible.builtin.set_fact:
+        cl_shard: "{{ cl_shard | default({}) | combine({hostvars[item].shard: {'replica': item, 'master': mst, 'master_id': (m[0] if m | length > 0 else ''), 'state': st | trim}}) }}"
+      loop: "{{ cl_replicas }}"
+      vars:
+        mst: "{{ cl_shard_master[hostvars[item].shard] }}"
+        m: "{{ cl_by_ip[hostvars[mst].ip] | default([]) }}"
+        r: "{{ cl_by_ip[hostvars[item].ip] | default([]) }}"
+        st: >-
+          {% if m | length > 8 and 'master' in m[2] and r | length > 3 and 'slave' in r[2] and r[3] == m[0] %}ok
+          {% elif r | length > 8 and 'master' in r[2] and m | length > 3 and 'slave' in m[2] and m[3] == r[0] %}ok-failed-over
+          {% elif m | length > 8 and 'master' in m[2] and r | length == 0 %}attach
+          {% else %}broken{% endif %}
+      when: not (ansible_check_mode and cl_fresh)
+
+    - name: Shard plan
+      ansible.builtin.debug:
+        msg: >-
+          {% if ansible_check_mode and cl_fresh %}{% for r in cl_replicas %}after create would attach {{ r }} -> {{ cl_shard_master[hostvars[r].shard] }}; {% endfor %}{% else %}{{ cl_shard }}{% endif %}
+
+    - name: STOP on broken shard
+      ansible.builtin.fail:
+        msg: "Shard {{ item.key }} is in an unexpected state: {{ item.value }}. Nothing changed for it."
+      loop: "{{ cl_shard | default({}) | dict2items }}"
+      when: item.value.state == 'broken'
+
+    - name: Replica must be empty and standalone before joining
+      ansible.builtin.assert:
+        that:
+          - cl_node[item.value.replica].known == 1
+          - cl_node[item.value.replica].dbsize == 0
+        fail_msg: "{{ item.value.replica }} is not empty/standalone: {{ cl_node[item.value.replica] }}"
+        quiet: true
+      loop: "{{ cl_shard | default({}) | dict2items }}"
+      when: item.value.state == 'attach'
+
+    # ------------------------------------------------------------ c) attach
+    - name: Attach replica to its designated master
+      ansible.builtin.command: >-
+        redis-cli --cluster add-node
+        {{ hostvars[item.value.replica].ip }}:{{ redis_port }}
+        {{ hostvars[item.value.master].ip }}:{{ redis_port }}
+        --cluster-slave --cluster-master-id {{ item.value.master_id }}
+      loop: "{{ cl_shard | default({}) | dict2items }}"
+      loop_control:
+        label: "shard {{ item.key }}: {{ item.value.replica }} -> {{ item.value.master }} ({{ item.value.master_id }})"
+      when: item.value.state == 'attach'
+      register: cl_attach
+      no_log: "{{ redis_password | length > 0 }}"
+
+    - name: Wait for replication link up
+      ansible.builtin.command: "{{ cli }} -h {{ hostvars[item.item.value.replica].ip }} info replication"
+      register: cl_repl
+      until: "'master_link_status:up' in cl_repl.stdout"
+      retries: 30
+      delay: 2
+      changed_when: false
+      loop: "{{ cl_attach.results | default([]) | select('changed') | list }}"
+      loop_control:
+        label: "{{ item.item.value.replica }}"
+
+    # ------------------------------------------------------------ d) check
+    - name: redis-cli --cluster check
+      ansible.builtin.command: redis-cli --cluster check {{ ip }}:{{ redis_port }}
+      register: cl_check
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        cl_check.rc != 0 or '[ERR]' in cl_check.stdout
+        or '[OK] All 16384 slots covered' not in cl_check.stdout
+      when: not (ansible_check_mode and cl_fresh)
+
+    - name: Final cluster nodes
+      ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster nodes"
+      register: cl_final
+      changed_when: false
+      check_mode: false
+
+    - name: Show
+      ansible.builtin.debug:
+        msg:
+          - "{{ cl_check.stdout_lines | default([]) }}"
+          - "{{ cl_final.stdout_lines | sort }}"
