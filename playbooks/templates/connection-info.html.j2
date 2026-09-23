@@ -1,0 +1,492 @@
+{#- Developer access page, rendered by playbooks/98_connection_info.yml from the LIVE
+    cluster state (ci_* facts). Never contains a password. -#}
+{%- set seeds = ci_seeds -%}
+{%- set hosts = ci_seeds | map('regex_replace', ':.*$', '') | list -%}
+{%- set port = redis_port -%}
+{%- set mb = (ci_maxmem | int / 1048576) | round(0) | int -%}
+{%- set total_mb = mb * (ci_masters | int) -%}
+{%- set mod_names = {'ReJSON': 'JSON', 'search': 'Search (Query Engine)', 'bf': 'Bloom', 'timeseries': 'TimeSeries', 'vectorset': 'Vector sets'} -%}
+{%- set ns = namespace(modules=[]) -%}
+{%- for m in ci_modules -%}{%- set ns.modules = ns.modules + [mod_names.get(m, m)] -%}{%- endfor -%}
+{%- set modules = ns.modules -%}
+{%- set is_prod = env_name == 'prod' -%}
+{%- set title = 'Redis ' ~ (env_label if is_prod else env_name | capitalize) ~ ' Cluster Access' -%}
+{%- set healthy = ci_state == 'ok' and (ci_slots | int) == 16384 -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>{{ title }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --paper: #f5f6f3;
+    --surface: #ffffff;
+    --ink: #1c211f;
+    --muted: #5b6561;
+    --rule: #d6dbd7;
+    --accent: {{ '#9a3b1f' if is_prod else '#0e6a64' }};
+    --accent-soft: {{ '#f6e6df' if is_prod else '#e2efed' }};
+    --warn: #8a5300;
+    --warn-soft: #fbf0dc;
+    --bad: #a3261b;
+    --bad-soft: #fbe4e1;
+    --code-bg: #eef1ee;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-head: "IBM Plex Sans Condensed", "IBM Plex Sans", system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --paper: #121615;
+      --surface: #1a1f1e;
+      --ink: #e4e9e6;
+      --muted: #9aa6a1;
+      --rule: #2d3533;
+      --accent: {{ '#f0916f' if is_prod else '#5cc2b8' }};
+      --accent-soft: {{ '#3a1f16' if is_prod else '#173331' }};
+      --warn: #e8b35a;
+      --warn-soft: #2e2615;
+      --bad: #f28b82;
+      --bad-soft: #3a1714;
+      --code-bg: #0e1211;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --paper: #121615;
+    --surface: #1a1f1e;
+    --ink: #e4e9e6;
+    --muted: #9aa6a1;
+    --rule: #2d3533;
+    --accent: {{ '#f0916f' if is_prod else '#5cc2b8' }};
+    --accent-soft: {{ '#3a1f16' if is_prod else '#173331' }};
+    --warn: #e8b35a;
+    --warn-soft: #2e2615;
+    --bad: #f28b82;
+    --bad-soft: #3a1714;
+    --code-bg: #0e1211;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.6 var(--font-body);
+    padding-inline: 16px;
+    padding-block: 40px 64px;
+  }
+  .page { max-width: 820px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 40px; }
+  h1, h2 { font-family: var(--font-head); text-wrap: balance; margin: 0; line-height: 1.15; }
+  h1 { font-size: 34px; font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 21px; font-weight: 600; }
+  p { margin: 0; max-width: 68ch; }
+  .eyebrow { font: 500 12px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+  header { display: grid; gap: 12px; }
+  header p { color: var(--muted); }
+  section, .panel { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  code, pre, .mono { font-family: var(--font-mono); font-size: 13.5px; }
+  :not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+  .facts { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; display: grid; margin: 0; }
+  .fact { display: grid; grid-template-columns: 170px 1fr; gap: 16px; padding: 12px 18px; border-top: 1px solid var(--rule); align-items: baseline; }
+  .fact:first-child { border-top: 0; }
+  .fact dt { color: var(--muted); font-size: 13px; }
+  .fact dd { margin: 0; min-width: 0; }
+  .strong { font-weight: 600; }
+  .seeds { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .seeds code { word-break: break-all; }
+  @media (max-width: 560px) { .fact { grid-template-columns: 1fr; gap: 2px; } }
+
+  button { font: 500 12.5px/1 var(--font-body); color: var(--accent); background: var(--accent-soft); border: 1px solid transparent; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible, [role="tab"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; min-width: 620px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 10px 14px; border-top: 1px solid var(--rule); white-space: nowrap; }
+  thead th { border-top: 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .role { font: 500 12px/1 var(--font-mono); padding: 3px 7px; border-radius: 4px; }
+  .role.m { background: var(--accent-soft); color: var(--accent); }
+  .role.r { background: var(--code-bg); color: var(--muted); }
+  .link-bad { color: var(--bad); font-weight: 600; }
+  .note { color: var(--muted); font-size: 13.5px; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  [role="tab"] { background: transparent; color: var(--muted); border: 1px solid var(--rule); }
+  [role="tab"][aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .panel { gap: 10px; }
+  .code { position: relative; }
+  pre { margin: 0; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 8px; padding: 16px 18px; overflow-x: auto; line-height: 1.55; }
+  .code button { position: absolute; top: 8px; right: 8px; }
+
+  .rules { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .rules li { display: grid; gap: 4px; padding-left: 16px; border-left: 2px solid var(--rule); }
+  .rules strong { font-weight: 600; }
+  .callout { background: var(--warn-soft); border-radius: 8px; padding: 14px 18px; display: grid; gap: 6px; }
+  .callout strong { color: var(--warn); }
+  .callout.bad { background: var(--bad-soft); }
+  .callout.bad strong { color: var(--bad); }
+  footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--rule); padding-top: 16px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <span class="eyebrow">{{ env_label }} environment · Redis Open Source {{ ci_version }}</span>
+    <h1>{{ title }}</h1>
+{% if is_prod %}
+    <p>How to connect an application to the <strong>production</strong> Redis Cluster: {{ ci_masters }} masters, {{ ci_replicas }} replicas, cluster mode{{ ', password required' if ci_auth else '' }}. Use a cluster-aware client and keep every connection setting in configuration.</p>
+{% else %}
+    <p>How to connect an application to the {{ env_label }} Redis Cluster. It has the same topology as production ({{ ci_masters }} masters, {{ ci_replicas }} replicas, cluster mode), so use the same cluster-aware client configuration you use in prod.</p>
+{% endif %}
+  </header>
+{% if not healthy or ci_unknown or not ci_split_ok %}
+
+  <div class="callout bad" role="alert">
+    <strong>Cluster needs attention</strong>
+{% if not healthy %}
+    <p>At generation time the cluster reported <code>cluster_state:{{ ci_state }}</code> with {{ ci_slots }}/16384 slots assigned. Ask DevOps before using it.</p>
+{% endif %}
+{% if ci_unknown %}
+    <p>Nodes not in the inventory: {% for u in ci_unknown %}<code>{{ u }}</code>{{ ', ' if not loop.last else '' }}{% endfor %}.</p>
+{% endif %}
+{% if not ci_split_ok %}
+    <p>At least one replica runs on the same Proxmox host as its master (or has no master), so losing that host could lose a shard.</p>
+{% endif %}
+  </div>
+{% endif %}
+
+  <section aria-labelledby="glance">
+    <h2 id="glance">At a glance</h2>
+    <dl class="facts">
+      <div class="fact"><dt>Mode</dt><dd><strong>Redis Cluster</strong>, so a cluster-aware client is required (a plain single-node client gets <code>MOVED</code> errors)</dd></div>
+      <div class="fact"><dt>Seed nodes</dt><dd class="seeds">
+        <code id="seedlist">{{ seeds | join(',') }}</code>
+        <button type="button" data-copy="seedlist">Copy</button></dd></div>
+      <div class="fact"><dt>Port</dt><dd class="mono">{{ port }} <span class="note">({{ redis_bus_port }} is the internal cluster bus; apps don't use it)</span></dd></div>
+{% if ci_auth %}
+      <div class="fact"><dt>Username / password</dt><dd><span class="strong">Password required.</span> No username (the <code>default</code> user). The password is not in this page: get it from DevOps / your secret store and inject it as <code>REDIS_PASSWORD</code>. Never commit it.</dd></div>
+{% else %}
+      <div class="fact"><dt>Username / password</dt><dd><span class="strong">None.</span> No AUTH, uses the default user. Leave the password empty or unset.</dd></div>
+{% endif %}
+      <div class="fact"><dt>TLS</dt><dd>{{ 'On' if ci_tls else 'Off (plain TCP)' }}</dd></div>
+      <div class="fact"><dt>Database</dt><dd><code>0</code> only (cluster mode has no <code>SELECT</code>)</dd></div>
+      <div class="fact"><dt>Network access</dt><dd>{% if ci_sources %}Only from {% for s in ci_sources %}<code>{{ s }}</code>{{ ', ' if not loop.last else '' }}{% endfor %}. Any other network needs a firewall change; ask DevOps.{% else %}No source restriction found in the firewall rules.{% endif %}</dd></div>
+{% if (ci_maxmem | int) > 0 %}
+      <div class="fact"><dt>Memory</dt><dd>{{ mb }} MB per master (~{{ (total_mb / 1024) | round(1) if total_mb >= 1024 else total_mb }} {{ 'GB' if total_mb >= 1024 else 'MB' }} total), policy <code>{{ ci_policy }}</code></dd></div>
+{% else %}
+      <div class="fact"><dt>Memory</dt><dd>No <code>maxmemory</code> limit, policy <code>{{ ci_policy }}</code></dd></div>
+{% endif %}
+{% if modules %}
+      <div class="fact"><dt>Modules</dt><dd>{{ modules | join(', ') }}</dd></div>
+{% endif %}
+    </dl>
+  </section>
+
+  <section aria-labelledby="nodes">
+    <h2 id="nodes">Nodes</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Node</th><th>Address</th><th>Role</th><th>Slots / replicates</th><th>Proxmox host</th><th>Link</th></tr></thead>
+        <tbody>
+{% for r in ci_rows %}
+          <tr><td>{{ r.host }}</td><td class="mono">{{ r.ip }}:{{ port }}</td><td><span class="role {{ 'm' if r.role == 'master' else 'r' }}">{{ r.role }}</span></td><td>{{ (r.slots | replace('-', '–')) if r.role == 'master' else ('of ' ~ r.master) }}</td><td>{{ r.pve_node }}</td><td{{ '' if r.link == 'connected' else ' class="link-bad"' }}>{{ r.link }}</td></tr>
+{% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Roles can swap after a failover. Don't hard-code "the master"; give the client all {{ seeds | length }} seeds and let it discover the topology.</p>
+  </section>
+
+  <section aria-labelledby="clients">
+    <h2 id="clients">Client configuration</h2>
+{% if ci_auth %}
+    <p class="note">All examples read the password from the <code>REDIS_PASSWORD</code> environment variable.</p>
+{% endif %}
+    <div class="tabs" role="tablist" aria-label="Client">
+      <button type="button" role="tab" id="t-env" aria-controls="p-env" aria-selected="true">Env vars</button>
+      <button type="button" role="tab" id="t-spring" aria-controls="p-spring" aria-selected="false">Spring Boot</button>
+      <button type="button" role="tab" id="t-lettuce" aria-controls="p-lettuce" aria-selected="false">Java · Lettuce</button>
+      <button type="button" role="tab" id="t-jedis" aria-controls="p-jedis" aria-selected="false">Java · Jedis</button>
+      <button type="button" role="tab" id="t-py" aria-controls="p-py" aria-selected="false">Python</button>
+      <button type="button" role="tab" id="t-ioredis" aria-controls="p-ioredis" aria-selected="false">Node · ioredis</button>
+      <button type="button" role="tab" id="t-noderedis" aria-controls="p-noderedis" aria-selected="false">Node · node-redis</button>
+      <button type="button" role="tab" id="t-go" aria-controls="p-go" aria-selected="false">Go</button>
+      <button type="button" role="tab" id="t-net" aria-controls="p-net" aria-selected="false">.NET</button>
+      <button type="button" role="tab" id="t-php" aria-controls="p-php" aria-selected="false">PHP</button>
+      <button type="button" role="tab" id="t-cli" aria-controls="p-cli" aria-selected="false">redis-cli</button>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-env" aria-labelledby="t-env">
+      <div class="code"><button type="button" data-copy="c-env">Copy</button><pre id="c-env">REDIS_CLUSTER_ENABLED=true
+REDIS_CLUSTER_NODES={{ seeds | join(',') }}
+REDIS_USERNAME=
+REDIS_PASSWORD={{ '&lt;from your secret store&gt;' if ci_auth else '' }}
+REDIS_TLS={{ 'true' if ci_tls else 'false' }}</pre></div>
+      <p class="note">Keep username, password and TLS as settings even when they are empty, so switching environments only changes values, not code.</p>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-spring" aria-labelledby="t-spring" hidden>
+      <div class="code"><button type="button" data-copy="c-spring">Copy</button><pre id="c-spring"># application-{{ env_name }}.yml (Spring Boot 3, Lettuce)
+spring:
+  data:
+    redis:
+      cluster:
+        nodes: {{ seeds | join(',') }}
+        max-redirects: 3
+      timeout: 2s
+{% if ci_auth %}
+      password: ${REDIS_PASSWORD}
+{% endif %}
+{% if ci_tls %}
+      ssl:
+        enabled: true
+{% endif %}
+      lettuce:
+        cluster:
+          refresh:
+            adaptive: true   # follow failovers quickly
+            period: 30s</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-lettuce" aria-labelledby="t-lettuce" hidden>
+      <div class="code"><button type="button" data-copy="c-lettuce">Copy</button><pre id="c-lettuce">List&lt;RedisURI&gt; seeds = Stream.of(
+{% for b in hosts | batch(3) %}
+        {{ b | map('regex_replace', '^(.*)$', '"\\1"') | join(', ') }}{{ ',' if not loop.last else ')' }}
+{% endfor %}
+{% if ci_auth %}
+    .map(h -&gt; RedisURI.builder().withHost(h).withPort({{ port }})
+        .withPassword(System.getenv("REDIS_PASSWORD").toCharArray())
+        .withSsl({{ 'true' if ci_tls else 'false' }}).build())
+    .toList();
+{% else %}
+    .map(h -&gt; RedisURI.create(h, {{ port }})).toList();
+{% endif %}
+
+RedisClusterClient client = RedisClusterClient.create(seeds);
+client.setOptions(ClusterClientOptions.builder()
+    .topologyRefreshOptions(ClusterTopologyRefreshOptions.builder()
+        .enableAllAdaptiveRefreshTriggers()
+        .enablePeriodicRefresh(Duration.ofSeconds(30))
+        .build())
+    .build());
+
+StatefulRedisClusterConnection&lt;String, String&gt; conn = client.connect();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-jedis" aria-labelledby="t-jedis" hidden>
+      <div class="code"><button type="button" data-copy="c-jedis">Copy</button><pre id="c-jedis">Set&lt;HostAndPort&gt; seeds = Set.of(
+{% for b in hosts | batch(2) %}
+    {% for h in b %}new HostAndPort("{{ h }}", {{ port }}){{ ', ' if not loop.last else '' }}{% endfor %}{{ ',' if not loop.last else ');' }}
+{% endfor %}
+{% if ci_auth or ci_tls %}
+
+JedisClientConfig config = DefaultJedisClientConfig.builder()
+{% if ci_auth %}
+    .password(System.getenv("REDIS_PASSWORD"))
+{% endif %}
+{% if ci_tls %}
+    .ssl(true)
+{% endif %}
+    .build();
+
+try (JedisCluster redis = new JedisCluster(seeds, config)) {
+{% else %}
+
+try (JedisCluster redis = new JedisCluster(seeds)) {
+{% endif %}
+    redis.set("hello", "world");
+}</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-py" aria-labelledby="t-py" hidden>
+      <div class="code"><button type="button" data-copy="c-py">Copy</button><pre id="c-py"># redis-py &gt;= 4.1
+{% if ci_auth %}
+import os
+{% endif %}
+from redis.cluster import RedisCluster, ClusterNode
+
+seeds = [{% for b in hosts | batch(3) %}{{ b | map('regex_replace', '^(.*)$', '"\\1"') | join(', ') }}{{ ',\n         ' if not loop.last else '' }}{% endfor %}]
+rc = RedisCluster(
+    startup_nodes=[ClusterNode(h, {{ port }}) for h in seeds],
+{% if ci_auth %}
+    password=os.environ["REDIS_PASSWORD"],
+{% endif %}
+{% if ci_tls %}
+    ssl=True,
+{% endif %}
+    decode_responses=True,
+)
+rc.set("hello", "world")</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-ioredis" aria-labelledby="t-ioredis" hidden>
+      <div class="code"><button type="button" data-copy="c-ioredis">Copy</button><pre id="c-ioredis">const Redis = require("ioredis");
+
+const cluster = new Redis.Cluster([
+{% for b in hosts | batch(2) %}
+  {% for h in b %}{ host: "{{ h }}", port: {{ port }} }{{ ', ' if not loop.last else '' }}{% endfor %},
+{% endfor %}
+{% if ci_auth or ci_tls %}
+], {
+  redisOptions: {
+{% if ci_auth %}
+    password: process.env.REDIS_PASSWORD,
+{% endif %}
+{% if ci_tls %}
+    tls: {},
+{% endif %}
+  },
+});
+{% else %}
+]);
+{% endif %}
+
+await cluster.set("hello", "world");</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-noderedis" aria-labelledby="t-noderedis" hidden>
+      <div class="code"><button type="button" data-copy="c-noderedis">Copy</button><pre id="c-noderedis">import { createCluster } from "redis";   // node-redis v4+
+
+const cluster = createCluster({
+  rootNodes: [
+{% for b in hosts | batch(3) %}
+    {{ b | map('regex_replace', '^(.*)$', '"\\1"') | join(', ') }},
+{% endfor %}
+  ].map((h) =&gt; ({ url: `{{ 'rediss' if ci_tls else 'redis' }}://${h}:{{ port }}` })),
+{% if ci_auth %}
+  defaults: { password: process.env.REDIS_PASSWORD },
+{% endif %}
+});
+cluster.on("error", (err) =&gt; console.error("Redis cluster error", err));
+await cluster.connect();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-go" aria-labelledby="t-go" hidden>
+      <div class="code"><button type="button" data-copy="c-go">Copy</button><pre id="c-go">// github.com/redis/go-redis/v9
+rdb := redis.NewClusterClient(&amp;redis.ClusterOptions{
+    Addrs: []string{
+{% for b in seeds | batch(3) %}
+        {{ b | map('regex_replace', '^(.*)$', '"\\1"') | join(', ') }},
+{% endfor %}
+    },
+{% if ci_auth %}
+    Password: os.Getenv("REDIS_PASSWORD"),
+{% endif %}
+{% if ci_tls %}
+    TLSConfig: &amp;tls.Config{},
+{% endif %}
+})
+err := rdb.Set(ctx, "hello", "world", 0).Err()</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-net" aria-labelledby="t-net" hidden>
+      <div class="code"><button type="button" data-copy="c-net">Copy</button><pre id="c-net">// StackExchange.Redis detects cluster mode automatically
+var mux = ConnectionMultiplexer.Connect(
+{% for b in seeds | batch(3) %}
+    "{{ b | join(',') }},"{{ ' +' }}
+{% endfor %}
+{% if ci_auth %}
+    "password=" + Environment.GetEnvironmentVariable("REDIS_PASSWORD") + "," +
+{% endif %}
+    "{{ 'ssl=true,' if ci_tls else '' }}abortConnect=false,connectTimeout=5000");
+IDatabase db = mux.GetDatabase();</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-php" aria-labelledby="t-php" hidden>
+      <div class="code"><button type="button" data-copy="c-php">Copy</button><pre id="c-php">// phpredis
+$redis = new RedisCluster(null, [
+{% for b in seeds | batch(3) %}
+    {{ b | map('regex_replace', '^(.*)$', "'\\1'") | join(', ') }},
+{% endfor %}
+], 2.0, 2.0{{ ', false, getenv(\'REDIS_PASSWORD\')' if ci_auth else '' }});
+$redis-&gt;set('hello', 'world');</pre></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="p-cli" aria-labelledby="t-cli" hidden>
+      <div class="code"><button type="button" data-copy="c-cli">Copy</button><pre id="c-cli">{% if ci_auth %}# redis-cli reads the password from REDISCLI_AUTH (never pass it with -a)
+export REDISCLI_AUTH="$REDIS_PASSWORD"
+{% endif %}# -c follows cluster redirects
+redis-cli -c -h {{ hosts[0] }} -p {{ port }}{{ ' --tls' if ci_tls else '' }}
+{{ hosts[0] }}:{{ port }}&gt; cluster info
+{{ hosts[0] }}:{{ port }}&gt; set hello world</pre></div>
+    </div>
+  </section>
+
+  <section aria-labelledby="rules">
+    <h2 id="rules">Things to know when coding against it</h2>
+    <ul class="rules">
+      <li><strong>The client must reach all {{ seeds | length }} nodes on {{ port }}.</strong><span>Clients get redirected (<code>MOVED</code>/<code>ASK</code>) to whichever node owns a key's slot, so every node has to be reachable, not just one seed.</span></li>
+      <li><strong>Multi-key commands need a shared hash tag.</strong><span><code>MGET</code>, <code>MSET</code>, transactions, Lua scripts and <code>SUNION</code>-style commands only work when all keys are in one slot. Put the common part in braces: <code>{user:42}:profile</code>, <code>{user:42}:cart</code>. Otherwise you get a <code>CROSSSLOT</code> error.</span></li>
+{% if ci_policy == 'noeviction' and (ci_maxmem | int) > 0 %}
+      <li><strong>Nothing is evicted.</strong><span>With {{ mb }} MB per master and <code>noeviction</code>, writes fail with an <code>OOM</code> error when a shard is full. Set TTLs on cache keys.</span></li>
+{% endif %}
+      <li><strong>Plan for a few seconds of failover.</strong><span>Node timeout is {{ redis_cluster_node_timeout // 1000 }} s, so a replica takes over a few seconds after its master fails. Enable topology refresh (see the Spring Boot and Lettuce examples) and retry on connection errors.</span></li>
+{% if modules %}
+      <li><strong>Modules are loaded.</strong><span>{{ modules | join(', ') }}. Check their cluster behaviour in DEV before relying on them in production.</span></li>
+{% endif %}
+    </ul>
+{% if is_prod %}
+    <div class="callout">
+      <strong>Production rules</strong>
+      <p>{{ 'Keep the password in a secret store and inject it at runtime; never put it in code, images or logs. ' if ci_auth else '' }}Don't run <code>KEYS</code>, <code>FLUSHALL</code>/<code>FLUSHDB</code>, load tests or debugging sessions here; use DEV for that. Data is persisted (RDB + AOF) and replicated, but it is not a backup, so keep your system of record elsewhere. Config changes go through DevOps.</p>
+    </div>
+{% else %}
+    <div class="callout">
+      <strong>{{ env_label }} vs production</strong>
+      <p>{{ env_label }} {{ 'requires a password' if ci_auth else 'has no password' }}{{ ' and uses TLS' if ci_tls else ' and no TLS' }}, and it may be rebuilt or wiped at any time. Don't store anything you need to keep. Production requires a password, so keep username, password and TLS as configuration so switching environments needs no code change.</p>
+    </div>
+{% endif %}
+  </section>
+
+  <footer>Generated {{ ci_generated }} by Ansible (<code>playbooks/98_connection_info.yml</code>) from the live cluster: Redis Open Source {{ ci_version }}, cluster_state {{ ci_state }}, {{ ci_slots }}/16384 slots, {{ ci_masters }} masters + {{ ci_replicas }} replicas, {{ 'each replica on a different Proxmox host than its master' if ci_split_ok else 'replica placement NOT verified' }}.</footer>
+</div>
+
+<script>
+  // Tabs
+  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+  function select(tab, focus) {
+    tabs.forEach(t => {
+      const on = t === tab;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    });
+    if (focus) tab.focus();
+  }
+  tabs.forEach((t, i) => {
+    t.tabIndex = i === 0 ? 0 : -1;
+    t.addEventListener('click', () => select(t, false));
+    t.addEventListener('keydown', e => {
+      const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (d) { e.preventDefault(); select(tabs[(i + d + tabs.length) % tabs.length], true); }
+    });
+  });
+
+  // Copy buttons
+  document.querySelectorAll('[data-copy]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const el = document.getElementById(btn.dataset.copy);
+      const text = el.innerText;
+      const done = () => { const o = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = o, 1500); };
+      const fallback = () => {
+        const r = document.createRange(); r.selectNodeContents(el);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        btn.textContent = 'Selected, press Ctrl+C';
+        setTimeout(() => btn.textContent = 'Copy', 2500);
+      };
+      try {
+        navigator.clipboard.writeText(text).then(done, fallback);
+      } catch (e) { fallback(); }
+    });
+  });
+</script>
+</body>
+</html>

@@ -9,3 +9,8 @@
   ansible.builtin.import_playbook: playbooks/04_redis.yml
 - name: Cluster
   ansible.builtin.import_playbook: playbooks/05_cluster.yml
+- name: Verify
+  ansible.builtin.import_playbook: playbooks/99_verify.yml
+# Last step: developer access page (HTML) + Markdown + env file from the live cluster.
+- name: Access page
+  ansible.builtin.import_playbook: playbooks/98_connection_info.yml
