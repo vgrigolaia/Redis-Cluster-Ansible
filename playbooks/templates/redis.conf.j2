@@ -1,5 +1,5 @@
 # {{ ansible_managed }}
-# Redis {{ redis_version }} - DEV cluster node {{ inventory_hostname }} (shard {{ shard }})
+# Redis {{ redis_version }} - {{ env_label }} cluster node {{ inventory_hostname }} (shard {{ shard }})
 # Original package config backed up at {{ redis_conf_path }}.orig
 
 {% if redis_load_modules %}

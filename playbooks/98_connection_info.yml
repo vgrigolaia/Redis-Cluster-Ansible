@@ -1,6 +1,6 @@
 ---
 # Read-only: collects the LIVE cluster state and prints connection details for
-# developers. Also writes output/redis-dev-connection.md and output/redis-dev.env
+# developers. Also writes output/redis-<env>-connection.md and output/redis-<env>.env
 # on the control node. Never prints a password (only whether auth is enabled).
 - name: 98 | Connection info for developers (read-only)
   hosts: redis_cluster[0]
@@ -90,7 +90,7 @@
         msg: "{{ ci_head + ci_node_lines + ci_tail }}"
       vars:
         ci_head:
-          - "Redis Cluster DEV - Redis Open Source {{ ci_version }}  (cluster_state: {{ ci_state }}, slots: {{ ci_slots }}/16384)"
+          - "Redis Cluster {{ env_label }} - Redis Open Source {{ ci_version }}  (cluster_state: {{ ci_state }}, slots: {{ ci_slots }}/16384)"
           - "Mode     : Redis Cluster - use a cluster-aware client"
           - "Seeds    : {{ ci_seeds | join(',') }}"
           - "Port     : {{ redis_port }}  (cluster bus {{ redis_bus_port }} is internal)"
@@ -103,7 +103,7 @@
         ci_node_lines: "{{ ci_rows | map(attribute='line') | map('regex_replace', '^', '  ') | list }}"
         ci_tail:
           - "{{ ('WARNING: nodes not in inventory: ' ~ ci_unknown | join(', ')) if ci_unknown else 'All cluster nodes are in the inventory.' }}"
-          - "Files    : output/redis-dev-connection.md, output/redis-dev.env"
+          - "Files    : output/redis-{{ env_name }}-connection.md, output/redis-{{ env_name }}.env"
 
     - name: Output directory on the control node
       ansible.builtin.file:
@@ -119,7 +119,7 @@
         dest: "{{ out_dir }}/{{ item.dest }}"
         mode: "0644"
       loop:
-        - { src: connection-info.md.j2, dest: redis-dev-connection.md }
-        - { src: connection-info.env.j2, dest: redis-dev.env }
+        - { src: connection-info.md.j2, dest: 'redis-{{ env_name }}-connection.md' }
+        - { src: connection-info.env.j2, dest: 'redis-{{ env_name }}.env' }
       delegate_to: localhost
       become: false

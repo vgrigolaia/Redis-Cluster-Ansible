@@ -1,12 +1,17 @@
 ---
+# ---------------------------------------------------------------- Environment
+# Branch `dev` = this cluster. Every name below that says dev derives from env_name.
+env_name: dev                                   # used in names, tags, file names
+env_label: "{{ env_name | upper }}"             # used in headings / messages
+
 # ---------------------------------------------------------------- Proxmox
 pve_template_node: "{{ groups['pve_template'][0] }}"   # set in inventory
 pve_template_vmid: 9010
-pve_template_name: alma10-redis-dev-tpl
+pve_template_name: alma10-redis-{{ env_name }}-tpl
 pve_storage: RBD-Disk
 pve_bridge: vmbr0
 pve_vlan_tag: ""            # empty = untagged
-pve_tag: redis-dev          # Proxmox tag set on the template and every VM
+pve_tag: redis-{{ env_name }}   # Proxmox tag set on the template and every VM
 # Hard safety allow-list: no task may touch a VMID outside this list.
 pve_managed_vmids: [9010, 270, 271, 272, 273, 274, 275]
 
@@ -14,7 +19,7 @@ pve_managed_vmids: [9010, 270, 271, 272, 273, 274, 275]
 alma_image_base_url: https://repo.almalinux.org/almalinux/10/cloud/x86_64/images
 alma_image_file: AlmaLinux-10-GenericCloud-10.2-20260817.0.x86_64.qcow2
 alma_image_sha256: bc59485c4828861a15887e30ff1bb913f0f16202fd7286208518f4814da1e10a
-alma_image_dir: /var/tmp/redis-dev-image
+alma_image_dir: /var/tmp/redis-{{ env_name }}-image
 
 # ---------------------------------------------------------------- VM sizing
 vm_cores: 1

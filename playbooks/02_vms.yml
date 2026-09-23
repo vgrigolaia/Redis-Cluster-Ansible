@@ -1,5 +1,5 @@
 ---
-# Full-clone the 6 Redis VMs from template 9010 directly onto their target node
+# Full-clone the 6 Redis VMs from the template directly onto their target node
 # (qm clone --target works because the disks live on shared Ceph), then
 # configure/verify/start each VM on its own node (qm is node-local, so those
 # tasks are delegated to hostvars[item].pve_node). Existing VMs are never

@@ -1,8 +1,9 @@
 ---
 # Health checks (read-only, plus a few temporary test keys).
 # Optional failover test - only with:  -e run_failover_test=true
-#   stops VM 270 (redis-dev-01) on its Proxmox node, confirms redis-dev-05 is
-#   promoted, starts 270 again, then CLUSTER FAILOVER on 270 restores the layout.
+#   hard-stops the first master (shard A) on its Proxmox node, confirms its
+#   replica is promoted, starts the VM again, then CLUSTER FAILOVER on it
+#   restores the original layout. Victim/replica/observer come from the inventory.
 
 - name: 99a | Verify cluster health and placement
   hosts: redis_cluster[0]
@@ -120,13 +121,14 @@
           - "Seeds: {{ groups['redis_cluster'] | map('extract', hostvars, 'ip') | map('regex_replace', '$', ':' ~ redis_port) | join(',') }}"
 
 # ---------------------------------------------------------------- failover
-- name: 99b | Failover test (VM 270 hard stop)
+- name: 99b | Failover test (first master hard stop)
   hosts: pve_template
   gather_facts: false
   vars:
-    fo_victim: redis-dev-01
-    fo_replica: redis-dev-05
-    fo_observer: redis-dev-02
+    fo_masters: "{{ groups['redis_cluster'] | map('extract', hostvars) | selectattr('role', 'equalto', 'master') | map(attribute='inventory_hostname') | list }}"
+    fo_victim: "{{ fo_masters[0] }}"
+    fo_replica: "{{ groups['redis_cluster'] | map('extract', hostvars) | selectattr('role', 'equalto', 'replica') | selectattr('shard', 'equalto', hostvars[fo_masters[0]].shard) | map(attribute='inventory_hostname') | first }}"
+    fo_observer: "{{ fo_masters[1] }}"
     cli: redis-cli -p {{ redis_port }}
   tasks:
     - name: Skip unless explicitly requested
