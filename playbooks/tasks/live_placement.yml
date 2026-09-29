@@ -1,0 +1,25 @@
+---
+# Read-only, run on a Proxmox node. Reads where Proxmox says our VMs run RIGHT NOW
+# (not where the inventory says they should run).
+# Sets on that node:  live_node = {vmid: proxmox node}   (managed VMIDs only)
+
+- name: Live placement | read cluster VM list (read-only)
+  ansible.builtin.command: pvesh get /cluster/resources --type vm --output-format json
+  register: lp_res
+  changed_when: false
+  check_mode: false
+
+- name: Live placement | managed VMs as reported by Proxmox
+  ansible.builtin.set_fact:
+    lp_managed: "{{ lp_res.stdout | from_json | selectattr('vmid', 'in', pve_managed_vmids) | list }}"
+
+- name: Live placement | index VMID -> node
+  ansible.builtin.set_fact:
+    live_node: "{{ dict(lp_managed | map(attribute='vmid') | zip(lp_managed | map(attribute='node'))) }}"
+
+- name: Live placement | every inventory VM exists in Proxmox
+  ansible.builtin.assert:
+    that: hostvars[item].vmid in live_node
+    fail_msg: "VMID {{ hostvars[item].vmid }} ({{ item }}) was not found in the Proxmox cluster."
+    quiet: true
+  loop: "{{ groups['redis_cluster'] }}"

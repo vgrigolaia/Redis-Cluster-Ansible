@@ -1,9 +1,18 @@
 ---
 # Health checks (read-only, plus a few temporary test keys).
+# Placement is read from Proxmox itself (99-pre), not from the inventory, so a VM that
+# was migrated by hand is judged where it really runs.
 # Optional failover test - only with:  -e run_failover_test=true
 #   hard-stops the first master (shard A) on its Proxmox node, confirms its
 #   replica is promoted, starts the VM again, then CLUSTER FAILOVER on it
 #   restores the original layout. Victim/replica/observer come from the inventory.
+
+- name: 99-pre | Where does Proxmox say the VMs run right now? (read-only)
+  hosts: pve_template
+  gather_facts: false
+  tasks:
+    - name: Live placement
+      ansible.builtin.import_tasks: tasks/live_placement.yml
 
 - name: 99a | Verify cluster health and placement
   hosts: redis_cluster[0]
@@ -12,6 +21,7 @@
   vars:
     cli: redis-cli -p {{ redis_port }}
     ip_to_host: "{{ dict(groups['redis_cluster'] | map('extract', hostvars, 'ip') | zip(groups['redis_cluster'])) }}"
+    live_node: "{{ hostvars[groups['pve_template'][0]].live_node }}"   # {vmid: real Proxmox node}, from 99-pre
   tasks:
     - name: cluster info
       ansible.builtin.command: "{{ cli }} -h {{ ip }} cluster info"
@@ -43,11 +53,11 @@
         row:
           host: "{{ h }}"
           vmid: "{{ hostvars[h].vmid }}"
-          pve_node: "{{ hostvars[h].pve_node }}"
+          pve_node: "{{ live_node[hostvars[h].vmid] }}"
           role: "{{ 'master' if is_master else 'replica' }}"
           slots: "{{ item[8:] | join(' ') }}"
           master: "{{ mh }}"
-          master_pve_node: "{{ hostvars[mh].pve_node if mh else '' }}"
+          master_pve_node: "{{ live_node[hostvars[mh].vmid] if mh else '' }}"
           link: "{{ item[7] }}"
 
     - name: Assertions
@@ -72,6 +82,15 @@
       loop: "{{ vf_rows | selectattr('role', 'equalto', 'replica') | list }}"
       loop_control:
         label: "{{ item.host }}@{{ item.pve_node }} -> {{ item.master }}@{{ item.master_pve_node }}"
+
+    - name: Inventory placement matches Proxmox (after a migration, update pve_node in hosts.yml)
+      ansible.builtin.assert:
+        that: hostvars[item].pve_node == live_node[hostvars[item].vmid]
+        fail_msg: >-
+          {{ item }} runs on {{ live_node[hostvars[item].vmid] }} but the inventory says
+          {{ hostvars[item].pve_node }} - update pve_node in hosts.yml.
+        quiet: true
+      loop: "{{ groups['redis_cluster'] }}"
 
     - name: Placement table (VM -> Proxmox host -> role)
       ansible.builtin.debug:
