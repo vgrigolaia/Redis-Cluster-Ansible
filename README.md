@@ -25,6 +25,7 @@ inventory/hosts.yml                # groups: proxmox, pve_template, redis_cluste
 inventory/group_vars/all/vars.yml  # every tunable value
 inventory/group_vars/redis_cluster/vars.yml   # SSH user/become for the VMs
 playbooks/tasks/preflight.yml      # VMID safety guard (shared by 01/02)
+playbooks/tasks/live_placement.yml # real VM -> Proxmox host map (used by 98 and 99)
 playbooks/templates/redis.conf.j2
 playbooks/01_template.yml … 05_cluster.yml, 99_verify.yml
 playbooks/98_connection_info.yml  # read-only: developer connection info from the live cluster
@@ -63,6 +64,9 @@ Deviations from the original spec, and why:
 * 02 ARP-probes (`arping -D`) each VM IP from the target node before a VM is started;
   an IP that answers aborts the run. 03 refuses to touch a host whose hostname is not
   the VM name (protects against IP conflicts).
+* 99 (and the access page from 98) read each VM's real Proxmox host from Proxmox, not from
+  the inventory. 99 fails if a replica shares a host with its master or if `pve_node` in
+  `hosts.yml` has drifted. After moving a VM by hand, update `pve_node`; until then 01/02 abort.
 * Nothing in this project stops, migrates or deletes a VM. The one exception is the
   optional failover test in 99, which requires `-e run_failover_test=true` and re-checks
   the VM name first.
