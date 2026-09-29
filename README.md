@@ -97,6 +97,7 @@ inventory/
   group_vars/redis_cluster/vars.yml # SSH user/become + host-key pinning for the VMs
 playbooks/
   tasks/preflight.yml               # safety guard shared by 01 and 02
+  tasks/live_placement.yml          # real VM -> Proxmox host map, used by 98 and 99
   01_template.yml                   # AlmaLinux cloud-init template on Ceph
   02_vms.yml                        # full clones, cloud-init network, start
   03_os.yml                         # OS tuning, firewalld, SELinux, THP off
@@ -262,7 +263,8 @@ ansible-playbook playbooks/98_connection_info.yml
 ```
 
 * **99** asserts `cluster_state:ok`, 16384 slots, 6 connected nodes, 3+3 roles, every
-  replica on a different host than its master; writes/reads test keys through different
+  replica on a different host than its master (host read live from Proxmox, not from the
+  inventory; it also fails if `pve_node` in `hosts.yml` has drifted); writes/reads test keys through different
   nodes and deletes them.
 * **98** (also the last step of `site.yml`) reads the live cluster and writes:
   * `output/redis-prod-access.html`: the **developer access page**. Open it in a browser
@@ -316,6 +318,7 @@ clients — **do not run it on a live PROD cluster outside a maintenance window.
 | Grow the disk | `qm disk resize <vmid> scsi0 +10G`, then in the VM `growpart`/`xfs_growfs` (cloud-utils-growpart). Update `vm_disk_size`. |
 | Rotate the Redis password | `ansible-vault edit …` → new `vault_redis_password`, then run 04. During the rolling restart nodes briefly disagree on the password (replication and clients see auth errors), so do it in a **maintenance window** and update the apps right after. |
 | OS updates | Patch one VM at a time (`dnf upgrade`, reboot), wait for `cluster_state:ok` and `master_link_status:up` before the next. Never reboot a master and its replica together. |
+| Move a VM to another Proxmox host | Migrate it, update `pve_node` in `hosts.yml`, keep a shard's master and replica on different hosts, then run 99 (it reads the real host from Proxmox and fails on a shared host or a stale inventory). Until the inventory is updated, 01/02 abort on purpose. |
 | After a failover | Nothing to do — 05/99 accept a shard in either direction. To restore the original layout run `CLUSTER FAILOVER` on the original master once it is a replica again. |
 | Rebuild a single VM | Not automated on purpose. Destroy it manually (see below), run 02-04, then `redis-cli --cluster add-node … --cluster-slave` or `cluster forget` the old ID first. Remove its old host key: `ssh-keygen -R <ip> -f ~/.ssh/known_hosts_redis_prod`. |
 
