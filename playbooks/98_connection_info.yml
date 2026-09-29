@@ -6,6 +6,13 @@
 #   output/redis-<env>.env              env vars for apps
 # Never prints or writes a password (only whether auth is enabled).
 # Runs as the last step of site.yml.
+- name: 98-pre | Where does Proxmox say the VMs run right now? (read-only)
+  hosts: pve_template
+  gather_facts: false
+  tasks:
+    - name: Live placement
+      ansible.builtin.import_tasks: tasks/live_placement.yml
+
 - name: 98 | Connection info for developers (read-only)
   hosts: redis_cluster[0]
   gather_facts: false
@@ -14,6 +21,7 @@
     cli: redis-cli -p {{ redis_port }} -h {{ ip }}
     ip_to_host: "{{ dict(groups['redis_cluster'] | map('extract', hostvars, 'ip') | zip(groups['redis_cluster'])) }}"
     out_dir: "{{ playbook_dir }}/../output"
+    live_node: "{{ hostvars[groups['pve_template'][0]].live_node }}"   # {vmid: real Proxmox node}, from 98-pre
   tasks:
     - name: Read live cluster state
       ansible.builtin.command: "{{ cli }} {{ item }}"
@@ -77,15 +85,15 @@
           host: "{{ host }}"
           ip: "{{ nip }}"
           vmid: "{{ hostvars[host].vmid | default('?') }}"
-          pve_node: "{{ hostvars[host].pve_node | default('?') }}"
+          pve_node: "{{ live_node[hostvars[host].vmid | default(0)] | default('?') }}"
           role: "{{ 'master' if is_master else 'replica' }}"
           slots: "{{ item[8:] | join(' ') }}"
           master: "{{ '' if is_master else (ip_to_host[m_ip] | default(m_ip)) }}"
-          master_pve_node: "{{ '' if is_master else (hostvars[ip_to_host[m_ip] | default('')].pve_node | default('?')) }}"
+          master_pve_node: "{{ '' if is_master else (live_node[hostvars[ip_to_host[m_ip] | default('')].vmid | default(0)] | default('?')) }}"
           detail: "{{ ('slots ' ~ (item[8:] | join(' '))) if is_master else ('of ' ~ (ip_to_host[m_ip] | default(m_ip))) }}"
           link: "{{ item[7] }}"
           line: >-
-            {{ hostvars[host].vmid | default('?') }} {{ host }}  {{ nip }}:{{ redis_port }}  {{ hostvars[host].pve_node | default('?') }}
+            {{ hostvars[host].vmid | default('?') }} {{ host }}  {{ nip }}:{{ redis_port }}  {{ live_node[hostvars[host].vmid | default(0)] | default('?') }}
             {{ 'master' if is_master else 'replica' }}
             {{ ('slots ' ~ (item[8:] | join(' '))) if is_master else ('of ' ~ (ip_to_host[m_ip] | default(m_ip))) }} [{{ item[7] }}]
 
